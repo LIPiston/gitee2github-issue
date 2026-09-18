@@ -1,3 +1,9 @@
+/**
+ * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
+ * 改动：1) Gitee 密码校验加固（未配置 GITEE_WEBHOOK_SECRET 即拒绝，长度校验 + 常量时间比较）；
+ *      2) 创建评论遇到 404 时返回「Gitee 端可能已删除该 issue」的诊断信息并记录日志。
+ * 详见本仓库根目录 MODIFICATIONS.md。
+ */
 import { Env, Result, GiteeIssue, GiteeComment } from '../types';
 
 export class GiteeService {

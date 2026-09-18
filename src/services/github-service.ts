@@ -1,3 +1,10 @@
+/**
+ * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
+ * 改动：1) verifyWebhookSignature 由直接 return true 改为真正的 HMAC-SHA256 校验；
+ *      2) 安装令牌改为按目标仓库动态解析（GET /repos/{owner}/{repo}/installation），
+ *         不再依赖固定的 GITHUB_INSTALLATION_ID。
+ * 详见本仓库根目录 MODIFICATIONS.md。
+ */
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { Env, Result } from '../types';

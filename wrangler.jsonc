@@ -1,4 +1,10 @@
 /**
+ * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
+ * 改动：新增 routes 绑定自定义域名（*.workers.dev 在中国大陆不可达，
+ *      Gitee 的 Webhook 请求会超时）。部署时请把 pattern 换成你自己的域名。
+ * 详见本仓库根目录 MODIFICATIONS.md。
+ */
+/**
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */

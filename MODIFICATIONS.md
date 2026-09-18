@@ -4,7 +4,7 @@
 
 - 上游仓库：[OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（本副本基于其 `836b381`）
 - 本副本：[LIPiston/gitee2github-issue](https://github.com/LIPiston/gitee2github-issue)
-- 上游仓库**未附带开源许可证**（GitHub API 返回 `license: null`），因此本副本不额外声明任何许可，仅作为部署实践与补丁记录分享。用于生产或二次分发前，请先联系上游作者取得授权。
+- **许可证**：上游以 **Apache-2.0 License** 授权（其 README「📄 许可证」段落声明，但仓库内未附 LICENSE 文件）。本副本沿用 Apache-2.0，并按该许可证第 4(b) 条在此声明：`src/services/github-service.ts`、`src/services/gitee-service.ts`、`wrangler.jsonc` 三个文件已被修改，修改内容见下节。许可证正文见 [LICENSE](./LICENSE)。上游没有 NOTICE 文件，本副本也未新增。
 - 克隆本副本：`git clone https://github.com/LIPiston/gitee2github-issue.git`
 
 ## 改动清单（相对上游 836b381）
