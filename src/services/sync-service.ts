@@ -475,6 +475,143 @@ export class SyncService {
     }
   }
 
+  /**
+   * 一次性回灌：把 GitHub 侧还没有映射记录的 issue 补建到 Gitee。
+   * 同步是事件驱动的，功能上线前就已经存在的 GitHub issue 不会被追溯，用这个接口补齐。
+   * 关键顺序：建完 issue 立刻写 issue_mappings —— Gitee 会马上回传 open 事件，
+   * 靠这条映射把它挡掉，否则会给同一条内容再建一个 GitHub issue。
+   * limit 控制单次请求处理的条数（Worker 有执行时长上限，建议一次 3-5 条，反复调用即可）。
+   */
+  async backfillGitHubIssuesToGitee(
+    repositoryId?: number,
+    dryRun = false,
+    limit = 4
+  ): Promise<Result<{ processed: number; remaining: number; results: any[] }>> {
+    try {
+      const allMappings = await this.getAllRepositoryMappings();
+      const repoMappings = repositoryId
+        ? allMappings.filter((m) => m.id === repositoryId)
+        : allMappings;
+
+      if (repoMappings.length === 0) {
+        return { success: false, error: '没有可用的仓库映射' };
+      }
+
+      const results: any[] = [];
+      const queue: Array<{ repoMapping: RepositoryMapping; issue: any }> = [];
+
+      for (const repoMapping of repoMappings) {
+        const listResult = await this.githubService.listIssues(
+          repoMapping.github_owner,
+          repoMapping.github_repo
+        );
+        if (!listResult.success) {
+          results.push({
+            repository: `${repoMapping.github_owner}/${repoMapping.github_repo}`,
+            action: 'error',
+            detail: listResult.error,
+          });
+          continue;
+        }
+
+        for (const issue of listResult.data!) {
+          const existing = await this.getIssueMappingByGithub(issue.number, repoMapping.id);
+          if (!existing) {
+            queue.push({ repoMapping, issue });
+          }
+        }
+      }
+
+      const batch = queue.slice(0, Math.max(1, limit));
+      let processed = 0;
+
+      for (const { repoMapping, issue } of batch) {
+        if (dryRun) {
+          results.push({
+            github_issue: `#${issue.number}`,
+            gitee_repo: `${repoMapping.gitee_owner}/${repoMapping.gitee_repo}`,
+            title: issue.title,
+            state: issue.state,
+            action: 'would_create',
+          });
+          continue;
+        }
+
+        const formattedBody = this.githubService.formatIssueBody(
+          issue.body,
+          issue.html_url,
+          issue.author
+        );
+        const createResult = await this.giteeService.createIssue(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          issue.title,
+          formattedBody
+        );
+        if (!createResult.success) {
+          results.push({
+            github_issue: `#${issue.number}`,
+            title: issue.title,
+            action: 'error',
+            detail: createResult.error,
+          });
+          continue;
+        }
+
+        const giteeIssue = createResult.data!;
+        await this.saveIssueMapping({
+          gitee_issue_id: giteeIssue.id,
+          gitee_issue_number: String(giteeIssue.number),
+          github_issue_number: issue.number,
+          repository_id: repoMapping.id,
+          gitee_url: giteeIssue.html_url,
+          github_url: issue.html_url,
+        });
+
+        let stateSynced: boolean | null = null;
+        if (issue.state === 'closed') {
+          const stateResult = await this.giteeService.updateIssueState(
+            repoMapping.gitee_owner,
+            repoMapping.gitee_repo,
+            String(giteeIssue.number),
+            'closed'
+          );
+          stateSynced = stateResult.success;
+          if (!stateResult.success) {
+            console.warn(`回灌后同步关闭状态失败: Gitee ${giteeIssue.number} ${stateResult.error}`);
+          }
+        }
+
+        processed += 1;
+        results.push({
+          github_issue: `#${issue.number}`,
+          gitee_issue: giteeIssue.number,
+          title: issue.title,
+          state: issue.state,
+          state_synced: stateSynced,
+          action: 'created',
+        });
+
+        // 轻微节流，避免触发 Gitee 写接口的频率限制
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+      }
+
+      return {
+        success: true,
+        data: {
+          processed,
+          remaining: Math.max(0, queue.length - batch.length),
+          results,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `回灌异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
   //==========================
   // 数据库操作方法
   //==========================

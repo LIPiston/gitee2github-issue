@@ -4,7 +4,7 @@
 
 - 上游仓库：[OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（本副本基于其 `836b381`）
 - 本副本：[LIPiston/gitee2github-issue](https://github.com/LIPiston/gitee2github-issue)
-- **许可证**：上游以 **Apache-2.0 License** 授权（其 README「📄 许可证」段落声明，但仓库内未附 LICENSE 文件）。本副本沿用 Apache-2.0，并按该许可证第 4(b) 条在此声明：`src/services/github-service.ts`、`src/services/gitee-service.ts`、`src/services/sync-service.ts`、`wrangler.jsonc` 四个文件已被修改，修改内容见下节。许可证正文见 [LICENSE](./LICENSE)。上游没有 NOTICE 文件，本副本也未新增。
+- **许可证**：上游以 **Apache-2.0 License** 授权（其 README「📄 许可证」段落声明，但仓库内未附 LICENSE 文件）。本副本沿用 Apache-2.0，并按该许可证第 4(b) 条在此声明：`src/index.ts`、`src/services/github-service.ts`、`src/services/gitee-service.ts`、`src/services/sync-service.ts`、`wrangler.jsonc` 五个文件已被修改，修改内容见下节。许可证正文见 [LICENSE](./LICENSE)。上游没有 NOTICE 文件，本副本也未新增。
 - 克隆本副本：`git clone https://github.com/LIPiston/gitee2github-issue.git`
 
 ## 改动清单（相对上游 836b381）
@@ -62,6 +62,23 @@ Gitee 把「创建 / 更新 issue」的接口从 `/repos/{owner}/{repo}/issues[/
 
 另外实测：**通过 API 修改 Gitee issue 状态不会触发 Gitee 的 webhook**（改了状态后 30 秒内没有任何投递）。所以 Gitee → GitHub 方向只对网页 / 人工操作生效，用 API 改 Gitee 状态不会回流到 GitHub。
 
+### 7. POST /api/backfill —— 历史 issue 回灌（新增）
+
+同步是事件驱动的，功能上线之前就存在于 GitHub 的 issue 不会被追溯。补了一个管理员接口：
+
+```bash
+curl -X POST https://<域>/api/backfill \
+  -H "Authorization: Bearer <ADMIN_PASSWORD>" \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run": true, "limit": 50}'
+```
+
+- `dry_run: true` 只列出待灌清单，不写任何东西；`limit` 控制单次处理的条数。
+- 每条的处理顺序：建 Gitee issue（正文带来源标注）→ **立刻**写 `issue_mappings` → 若 GitHub 侧是 closed 则跟着关闭。
+- 顺序是关键：Gitee 建完 issue 会马上回传 `issue_hooks/open`，只有映射已经落库才能把它挡掉，否则会给同一条内容再建一个 GitHub issue。所以回灌必须在这个（同一个 Worker）请求里做，不能拿外部脚本“建一条、再慢慢写库”。
+- Worker 有执行时长限制，`limit` 建议 3-5，反复调用直到 `remaining` 为 0（接口会把剩余条数返回）。
+- 实测：12 条历史 issue（#2-#10、#12、#13、#15）一次灌完，Gitee 侧 15 条与 GitHub 侧一一对应，GitHub 侧没有多出任何一条（防重复逻辑在真实事件下生效 12 次）。
+
 ## 部署踩坑记录
 
 1. **workers.dev 在国内不可用** —— 必须绑定自定义域名，否则 Gitee 的 Webhook 一定超时（症状：Gitee 后台显示请求超时/失败）。
@@ -93,7 +110,7 @@ Gitee 把「创建 / 更新 issue」的接口从 `/repos/{owner}/{repo}/issues[/
 ## 已知待改进
 
 - 标题 / 正文的后续编辑不同步（只处理创建、评论、关闭、重开）。
-- 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；同步功能上线之前已经在 GitHub 侧建好的 issue 不会自动回灌到 Gitee，需要手工补齐或写一次性回灌脚本。
+- 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；上线前已在 GitHub 侧建好的 issue 用 `POST /api/backfill`（见第 7 节）补，并且接口本身也没有节流重试。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。
 
@@ -108,5 +125,6 @@ Gitee 把「创建 / 更新 issue」的接口从 `/repos/{owner}/{repo}/issues[/
 | GitHub → Gitee | 评论回写 | Gitee 评论 51264768 ↔ GitHub 评论 5730066539 |
 | 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
+| 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。

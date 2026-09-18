@@ -218,6 +218,39 @@ export class GitHubService {
   }
 
   /**
+   * 列出仓库的全部 issue（含已关闭，排除 Pull Request）—— 回灌用
+   */
+  async listIssues(owner: string, repo: string): Promise<Result<any[]>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const raw: any[] = await octokit.paginate(octokit.issues.listForRepo, {
+        owner,
+        repo,
+        state: 'all',
+        per_page: 100,
+      });
+
+      const issues = raw
+        .filter((item: any) => !item.pull_request)
+        .map((item: any) => ({
+          number: item.number as number,
+          title: item.title as string,
+          body: (item.body as string) || '',
+          state: item.state as 'open' | 'closed',
+          html_url: item.html_url as string,
+          author: (item.user?.login as string) || 'unknown',
+        }));
+
+      return { success: true, data: issues };
+    } catch (error) {
+      return {
+        success: false,
+        error: `列出GitHub Issue失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * 更新 GitHub Issue 状态（open / closed）
    */
   async updateIssueState(

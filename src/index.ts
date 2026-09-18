@@ -1,3 +1,8 @@
+/**
+ * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
+ * 改动：新增 POST /api/backfill（管理员口令鉴权的回灌接口，把 GitHub 侧历史
+ *      issue 补建到 Gitee）。详见本仓库根目录 MODIFICATIONS.md。
+ */
 import { SyncService } from './services/sync-service';
 import { Env } from './types';
 
@@ -149,6 +154,39 @@ export default {
           data: { id: mappingId }
         }), {
           headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      // 回灌：把 GitHub 侧还没有映射的 issue 补建到 Gitee（需管理员口令）
+      // 用法：POST /api/backfill  Header: Authorization: Bearer <ADMIN_PASSWORD>
+      //       body 可选 { "repository_id": 1, "dry_run": true, "limit": 4 }
+      if (path === '/api/backfill' && request.method === 'POST') {
+        if (!await verifyApiAccess(request)) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: '未授权访问'
+          }), {
+            headers: { 'Content-Type': 'application/json' },
+            status: 401
+          });
+        }
+
+        let body: any = {};
+        try {
+          body = await request.json() as any;
+        } catch {
+          body = {};
+        }
+
+        const result = await syncService.backfillGitHubIssuesToGitee(
+          typeof body.repository_id === 'number' ? body.repository_id : undefined,
+          body.dry_run === true,
+          typeof body.limit === 'number' ? body.limit : 4
+        );
+
+        return new Response(JSON.stringify(result), {
+          headers: { 'Content-Type': 'application/json' },
+          status: result.success ? 200 : 400
         });
       }
 
