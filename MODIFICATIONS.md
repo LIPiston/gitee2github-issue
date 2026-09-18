@@ -4,7 +4,7 @@
 
 - 上游仓库：[OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（本副本基于其 `836b381`）
 - 本副本：[LIPiston/gitee2github-issue](https://github.com/LIPiston/gitee2github-issue)
-- **许可证**：上游以 **Apache-2.0 License** 授权（其 README「📄 许可证」段落声明，但仓库内未附 LICENSE 文件）。本副本沿用 Apache-2.0，并按该许可证第 4(b) 条在此声明：`src/services/github-service.ts`、`src/services/gitee-service.ts`、`wrangler.jsonc` 三个文件已被修改，修改内容见下节。许可证正文见 [LICENSE](./LICENSE)。上游没有 NOTICE 文件，本副本也未新增。
+- **许可证**：上游以 **Apache-2.0 License** 授权（其 README「📄 许可证」段落声明，但仓库内未附 LICENSE 文件）。本副本沿用 Apache-2.0，并按该许可证第 4(b) 条在此声明：`src/services/github-service.ts`、`src/services/gitee-service.ts`、`src/services/sync-service.ts`、`wrangler.jsonc` 四个文件已被修改，修改内容见下节。许可证正文见 [LICENSE](./LICENSE)。上游没有 NOTICE 文件，本副本也未新增。
 - 克隆本副本：`git clone https://github.com/LIPiston/gitee2github-issue.git`
 
 ## 改动清单（相对上游 836b381）
@@ -29,7 +29,17 @@
 - **Gitee 密码校验加固**：上游实现是 `data.password === this.env.GITEE_WEBHOOK_SECRET`，一旦没有配置该 secret，`undefined === undefined` 会成立，端点等于对所有人开放。改为未配置密钥即拒绝、类型/长度校验 + 常量时间比较。
 - **404 诊断提示**：创建 Gitee 评论遇到 404 时，返回“可能是 Gitee 端已删除该 issue（issue_mappings 中的映射已失效）”，并写 `console.error`。触发场景：Gitee 端的 issue 被删除，但 `issue_mappings` 里的映射还留着。
 
-### 4. scripts/encode-github-app-key.mjs（新增）
+### 4. src/services/sync-service.ts —— issue 创建与关闭/重开双向同步（新增能力）
+
+上游只有「Gitee 建 issue → GitHub 建 issue」单向，且 GitHub 侧的 `issues.opened` 被显式跳过，关闭/重开完全没处理。本副本补上：
+
+- **GitHub 建 issue → Gitee 建 issue**：`handleGitHubNewIssue`。正文附带来源标注（`formatIssueBody`，含原作者与原始链接），创建成功后写入 `issue_mappings` 建立双向映射。
+- **关闭 / 重开双向同步**：Gitee 侧 `close` / `reopen` → `handleGiteeIssueStateChange`（调 GitHub `issues.update`）；GitHub 侧 `closed` / `reopened` → `handleGitHubIssueStateChange`（调 Gitee `PATCH /issues/{number}`）。
+- **回环抑制**：写状态前先读目标端当前状态（`getIssueState`），已经是目标状态就直接跳过。否则「Gitee 关 → GitHub 关 → GitHub 发事件 → 又去关 Gitee」会来回写。
+- **重复创建防护**：两边建 issue 前都先查 `issue_mappings`，已有映射的事件直接跳过（否则 Gitee→GitHub 建完之后，Gitee 那边回传的 `issue_hooks open` 会再建一个 GitHub issue，形成死循环）。
+- **软跳过**：事件里的 issue 没有映射（不是同步创建的）时，返回 2xx + 说明文字并 `console.warn`，而不是 400——这类事件是正常情况，报 4xx 会让 Gitee / GitHub 的投递记录堆满失败。
+
+### 5. scripts/encode-github-app-key.mjs（新增）
 
 把 GitHub App 的 **PKCS#8** 私钥转成“单行 + 字面 `\n`”的字符串，供 `wrangler secret put` 使用，并在写入前用 `crypto.createPrivateKey` 自校验。
 
@@ -48,7 +58,7 @@ node scripts/encode-github-app-key.mjs /path/to/pkcs8-private-key.pem | npx wran
 4. **`wrangler d1 create` 报 Authentication error（code 10000）** 时，可以在 Cloudflare 控制台手动建库，再把 `database_id` 填进 `wrangler.jsonc`。
 5. **D1 外键约束**：`issue_mappings` 被 `comment_mappings.issue_id` 引用，删除映射前必须先删依赖的 `comment_mappings` 行，否则报 `SQLITE_CONSTRAINT_FOREIGNKEY`。
 6. **GitHub App 的投递明细看不到响应体**：`GET /app/hook/deliveries/{id}` 只返回响应头，Worker 返回的具体错误信息只能从自己的日志里看。
-7. **事件范围**：新建 issue 只做 Gitee → GitHub（GitHub 侧新建 issue 被显式跳过，避免回环）；评论双向；关闭 / 重开 / 标题正文编辑都不同步。
+7. **事件范围**（本副本已扩展）：issue 创建双向、评论双向、关闭/重开双向；标题与正文的后续编辑不同步；删除不同步（Gitee 端删除会留下映射，见第 3 节 404 诊断）。
 
 ## 需要配置的 secrets
 
@@ -59,11 +69,12 @@ node scripts/encode-github-app-key.mjs /path/to/pkcs8-private-key.pem | npx wran
 | `GITEE_WEBHOOK_SECRET` | 与 Gitee 仓库 Webhook 里填的“密码”一致 |
 | `GITHUB_WEBHOOK_SECRET` | 与 GitHub App 的 Webhook secret 一致 |
 | `ADMIN_PASSWORD` | Web 管理界面登录密码 |
-| `GITEE_TOKEN` | 仅 GitHub → Gitee 评论回写需要，需 issues + notes 权限 |
+| `GITEE_TOKEN` | GitHub → Gitee 方向的评论回写、建 issue、改状态都需要，**必须勾选 `issues` 与 `notes` 权限**；权限不足时 Gitee 会返回 404 `project or enterprise`（伪装成找不到仓库）或 401 `no 'projects' scope` |
 | `GITHUB_TOKEN` | 可选的 PAT 兼容模式，与 GitHub App 二选一（App 优先） |
 
 ## 已知待改进
 
-- 关闭 / 重开状态不同步（两个方向都不支持）。
+- 标题 / 正文的后续编辑不同步（只处理创建、评论、关闭、重开）。
+- 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；同步功能上线之前已经在 GitHub 侧建好的 issue 不会自动回灌到 Gitee，需要手工补齐或写一次性回灌脚本。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。

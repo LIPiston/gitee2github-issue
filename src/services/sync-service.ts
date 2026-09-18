@@ -1,3 +1,10 @@
+/**
+ * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
+ * 改动：1) GitHub 新建 issue 同步到 Gitee（原实现显式跳过）；
+ *      2) 两侧关闭/重开状态双向同步，写前比对目标端状态以抑制事件回环；
+ *      3) 建 issue 前查映射防止重复创建；无映射的事件软跳过（2xx）而非报 400。
+ * 详见本仓库根目录 MODIFICATIONS.md。
+ */
 import { Env, Result, GiteeWebhookEvent, RepositoryMapping, IssueMapping } from '../types';
 import { GiteeService } from './gitee-service';
 import { GitHubService } from './github-service';
@@ -38,6 +45,9 @@ export class SyncService {
       } else if ((event.hook_name === 'issue_hooks' || event.hook_name === 'note_hooks') && event.action === 'comment') {
         // 处理Issue评论事件
         return await this.handleGiteeNewComment(event, eventId);
+      } else if (event.hook_name === 'issue_hooks' && ['close', 'closed', 'reopen', 'reopened'].includes(event.action)) {
+        // 处理Issue关闭/重开事件
+        return await this.handleGiteeIssueStateChange(event, eventId);
       }
 
       return { success: true, data: `不支持的事件类型: ${event.hook_name} ${event.action}` };
@@ -69,8 +79,11 @@ export class SyncService {
 
       // 根据事件类型处理
       if (eventType === 'issues' && event.action === 'opened') {
-        // 不处理GitHub新建Issue，因为我们专注于Gitee到GitHub的同步
-        return { success: true, data: '不处理GitHub新建Issue事件' };
+        // GitHub 新建 Issue -> 在 Gitee 上创建对应 Issue
+        return await this.handleGitHubNewIssue(event, eventId);
+      } else if (eventType === 'issues' && ['closed', 'reopened'].includes(event.action)) {
+        // GitHub 关闭/重开 Issue -> 同步 Gitee 的状态
+        return await this.handleGitHubIssueStateChange(event, eventId);
       } else if (eventType === 'issue_comment' && event.action === 'created') {
         // 处理Issue评论事件
         return await this.handleGitHubNewComment(event, eventId);
@@ -105,6 +118,15 @@ export class SyncService {
 
       const issueId = event.issue.id;
       const issueNumber = event.issue.number; // 这是Gitee的issue编号，如I123AB
+      // 已有映射说明这条 issue 之前同步过（例如刚从 GitHub 方向创建过来的），跳过以免重复创建
+      const existingMapping = await this.getIssueMapping(issueId, repoMapping.id);
+      if (existingMapping) {
+        return {
+          success: true,
+          data: `该 Issue 已同步过（GitHub #${existingMapping.github_issue_number}），跳过`,
+        };
+      }
+
       const issueTitle = event.issue.title;
       const issueBody = event.issue.body;
       const issueUrl = event.issue.html_url;
@@ -277,6 +299,179 @@ export class SyncService {
       return { success: true, data: `成功同步GitHub评论到Gitee` };
     } catch (error) {
       return { success: false, error: `处理GitHub新评论异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 处理Gitee Issue 关闭/重开事件（同步到 GitHub）
+   */
+  private async handleGiteeIssueStateChange(event: GiteeWebhookEvent, eventId: string): Promise<Result<string>> {
+    try {
+      if (!event.issue) {
+        return { success: false, error: 'Issue信息不存在' };
+      }
+
+      const [giteeOwner, giteeRepo] = event.repository.full_name.split('/');
+      const repoMapping = await this.getRepositoryMapping(giteeOwner, giteeRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${giteeOwner}/${giteeRepo}` };
+      }
+
+      const issueMapping = await this.getIssueMapping(event.issue.id, repoMapping.id);
+      if (!issueMapping) {
+        // 不是同步创建的 issue（例如直接在 Gitee 侧新建后未建立映射）：软跳过，返回 2xx 避免 Gitee 记为投递失败
+        console.warn(`Gitee issue ${event.issue.id} 没有映射记录，跳过状态同步`);
+        return { success: true, data: `Gitee issue ${event.issue.id} 没有同步记录（非同步创建的 issue），跳过` };
+      }
+
+      const state: 'open' | 'closed' = event.action.startsWith('reopen') ? 'open' : 'closed';
+
+      // 目标端已经是该状态时直接跳过（这种情况通常就是上一步写回造成的事件回环）
+      const currentState = await this.githubService.getIssueState(
+        repoMapping.github_owner,
+        repoMapping.github_repo,
+        issueMapping.github_issue_number
+      );
+      if (currentState.success && currentState.data === state) {
+        return {
+          success: true,
+          data: `GitHub Issue #${issueMapping.github_issue_number} 已经是 ${state} 状态，跳过`,
+        };
+      }
+
+      const updateResult = await this.githubService.updateIssueState(
+        repoMapping.github_owner,
+        repoMapping.github_repo,
+        issueMapping.github_issue_number,
+        state
+      );
+      if (!updateResult.success) {
+        return { success: false, error: updateResult.error };
+      }
+
+      await this.saveWebhookEvent(eventId, `issue_${state}`, 'gitee');
+      return {
+        success: true,
+        data: `已同步 Gitee ${state === 'closed' ? '关闭' : '重开'} 到 GitHub Issue #${issueMapping.github_issue_number}`,
+      };
+    } catch (error) {
+      return { success: false, error: `处理Gitee Issue状态变更异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 处理GitHub新建Issue事件（在 Gitee 创建对应 Issue，并建立映射，避免回环）
+   */
+  private async handleGitHubNewIssue(event: any, eventId: string): Promise<Result<string>> {
+    try {
+      if (!event.issue) {
+        return { success: false, error: 'Issue信息不存在' };
+      }
+
+      const [githubOwner, githubRepo] = event.repository.full_name.split('/');
+      const repoMapping = await this.getRepositoryMappingByGithub(githubOwner, githubRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
+      }
+
+      // 已经由 Gitee 同步过来的 issue 会带映射，跳过以免重复创建
+      const existingMapping = await this.getIssueMappingByGithub(event.issue.number, repoMapping.id);
+      if (existingMapping) {
+        return {
+          success: true,
+          data: `该 Issue 已由 Gitee 同步而来（Gitee ${existingMapping.gitee_issue_number}），跳过`,
+        };
+      }
+
+      const authorName = event.issue.user?.login || 'unknown';
+      const formattedBody = this.githubService.formatIssueBody(
+        event.issue.body || '',
+        event.issue.html_url,
+        authorName
+      );
+
+      const createResult = await this.giteeService.createIssue(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        event.issue.title,
+        formattedBody
+      );
+      if (!createResult.success) {
+        return { success: false, error: createResult.error };
+      }
+
+      const giteeIssue = createResult.data!;
+      await this.saveIssueMapping({
+        gitee_issue_id: giteeIssue.id,
+        gitee_issue_number: String(giteeIssue.number),
+        github_issue_number: event.issue.number,
+        repository_id: repoMapping.id,
+        gitee_url: giteeIssue.html_url,
+        github_url: event.issue.html_url,
+      });
+
+      await this.saveWebhookEvent(eventId, 'issue_create', 'github');
+      return { success: true, data: `已在 Gitee 创建对应 Issue: ${giteeIssue.html_url}` };
+    } catch (error) {
+      return { success: false, error: `处理GitHub新建Issue异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 处理GitHub Issue 关闭/重开事件（同步到 Gitee）
+   */
+  private async handleGitHubIssueStateChange(event: any, eventId: string): Promise<Result<string>> {
+    try {
+      const issueNumber = event.issue.number;
+      const [githubOwner, githubRepo] = event.repository.full_name.split('/');
+
+      const repoMapping = await this.getRepositoryMappingByGithub(githubOwner, githubRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
+      }
+
+      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      if (!issueMapping) {
+        // 该 GitHub issue 不是从 Gitee 同步来的：软跳过（返回 2xx），避免 GitHub 记为投递失败
+        console.warn(`GitHub #${issueNumber} 没有映射记录，跳过状态同步`);
+        return { success: true, data: `GitHub #${issueNumber} 没有同步记录（非同步创建的 issue），跳过` };
+      }
+      if (!issueMapping.gitee_issue_number) {
+        return { success: false, error: '找不到对应的Gitee Issue编号' };
+      }
+
+      const state: 'open' | 'closed' = event.action === 'reopened' ? 'open' : 'closed';
+
+      // 目标端已经是该状态时直接跳过（这种情况通常就是上一步写回造成的事件回环）
+      const currentState = await this.giteeService.getIssueState(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        issueMapping.gitee_issue_number
+      );
+      if (currentState.success && currentState.data === state) {
+        return {
+          success: true,
+          data: `Gitee ${issueMapping.gitee_issue_number} 已经是 ${state} 状态，跳过`,
+        };
+      }
+
+      const updateResult = await this.giteeService.updateIssueState(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        issueMapping.gitee_issue_number,
+        state
+      );
+      if (!updateResult.success) {
+        return { success: false, error: updateResult.error };
+      }
+
+      await this.saveWebhookEvent(eventId, `issue_${state}`, 'github');
+      return {
+        success: true,
+        data: `已同步 GitHub ${state === 'closed' ? '关闭' : '重开'} 到 Gitee ${issueMapping.gitee_issue_number}`,
+      };
+    } catch (error) {
+      return { success: false, error: `处理GitHub Issue状态变更异常: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 

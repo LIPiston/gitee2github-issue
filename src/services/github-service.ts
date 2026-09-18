@@ -198,6 +198,58 @@ export class GitHubService {
   }
 
   /**
+   * 读取 GitHub Issue 当前状态（用于判断是否需要写回，避免两侧来回写形成回环）
+   */
+  async getIssueState(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+  ): Promise<Result<'open' | 'closed'>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const response = await octokit.issues.get({ owner, repo, issue_number: issueNumber });
+      return { success: true, data: response.data.state as 'open' | 'closed' };
+    } catch (error) {
+      return {
+        success: false,
+        error: `读取GitHub Issue状态失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 更新 GitHub Issue 状态（open / closed）
+   */
+  async updateIssueState(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    state: 'open' | 'closed',
+  ): Promise<Result<{ number: number }>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const response = await octokit.issues.update({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        state,
+      });
+
+      return {
+        success: true,
+        data: {
+          number: response.data.number,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `更新GitHub Issue状态失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * 创建评论
    */
   async createComment(
@@ -234,5 +286,12 @@ export class GitHubService {
    */
   formatCommentBody(body: string, githubAuthor: string): string {
     return `${body || ''}\n\n---\n> 🤖 此评论由机器人从GitHub同步 | 原始作者: [${githubAuthor}](https://github.com/${githubAuthor})`;
+  }
+
+  /**
+   * 处理GitHub Issue正文，为同步到Gitee做准备
+   */
+  formatIssueBody(body: string, githubIssueUrl: string, githubAuthor: string): string {
+    return `${body || ''}\n\n---\n> 🤖 此Issue由机器人从GitHub同步 | 原始作者: [${githubAuthor}](https://github.com/${githubAuthor}) | 原始链接: ${githubIssueUrl}`;
   }
 }
