@@ -239,6 +239,11 @@ export class GitHubService {
           state: item.state as 'open' | 'closed',
           html_url: item.html_url as string,
           author: (item.user?.login as string) || 'unknown',
+          labels: (item.labels || []).map((label: any) =>
+            typeof label === 'string'
+              ? { name: label as string }
+              : { name: label.name as string, color: (label.color as string) || undefined }
+          ),
         }));
 
       return { success: true, data: issues };

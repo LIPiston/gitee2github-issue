@@ -181,7 +181,8 @@ export default {
         const result = await syncService.backfillGitHubIssuesToGitee(
           typeof body.repository_id === 'number' ? body.repository_id : undefined,
           body.dry_run === true,
-          typeof body.limit === 'number' ? body.limit : 4
+          typeof body.limit === 'number' ? body.limit : 4,
+          body.mode === 'labels' ? 'labels' : 'issues'
         );
 
         return new Response(JSON.stringify(result), {

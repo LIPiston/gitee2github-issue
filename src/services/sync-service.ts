@@ -2,7 +2,9 @@
  * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
  * 改动：1) GitHub 新建 issue 同步到 Gitee（原实现显式跳过）；
  *      2) 两侧关闭/重开状态双向同步，写前比对目标端状态以抑制事件回环；
- *      3) 建 issue 前查映射防止重复创建；无映射的事件软跳过（2xx）而非报 400。
+ *      3) 建 issue 前查映射防止重复创建；无映射的事件软跳过（2xx）而非报 400；
+ *      4) 标签同步（GitHub → Gitee）：创建时复制、labeled/unlabeled 事件、回灌补齐；
+ *      5) 新增回灌方法（把 GitHub 侧历史 issue 补建到 Gitee，或只补齐标签）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeWebhookEvent, RepositoryMapping, IssueMapping } from '../types';
@@ -84,6 +86,9 @@ export class SyncService {
       } else if (eventType === 'issues' && ['closed', 'reopened'].includes(event.action)) {
         // GitHub 关闭/重开 Issue -> 同步 Gitee 的状态
         return await this.handleGitHubIssueStateChange(event, eventId);
+      } else if (eventType === 'issues' && ['labeled', 'unlabeled'].includes(event.action)) {
+        // GitHub 增删标签 -> 同步到 Gitee
+        return await this.handleGitHubLabelChange(event, eventId);
       } else if (eventType === 'issue_comment' && event.action === 'created') {
         // 处理Issue评论事件
         return await this.handleGitHubNewComment(event, eventId);
@@ -410,8 +415,23 @@ export class SyncService {
         github_url: event.issue.html_url,
       });
 
+      // 顺带把标签复制过去（Gitee 里没有的标签会先建同名同色）
+      const labelResult = await this.syncLabelsToGitee(
+        repoMapping,
+        String(giteeIssue.number),
+        event.issue.labels || [],
+        'set'
+      );
+
       await this.saveWebhookEvent(eventId, 'issue_create', 'github');
-      return { success: true, data: `已在 Gitee 创建对应 Issue: ${giteeIssue.html_url}` };
+      return {
+        success: true,
+        data:
+          `已在 Gitee 创建对应 Issue: ${giteeIssue.html_url}` +
+          (labelResult.success && labelResult.data!.length > 0
+            ? `（标签: ${labelResult.data!.join(', ')}）`
+            : ''),
+      };
     } catch (error) {
       return { success: false, error: `处理GitHub新建Issue异常: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -476,6 +496,128 @@ export class SyncService {
   }
 
   /**
+   * 把 GitHub 的标签同步到 Gitee 的某个 issue 上。
+   * mode='set' 用给定标签整体替换（创建 / 回灌 / 补齐时用）；mode='add' 只追加（labeled 事件用）。
+   * Gitee 对「仓库里不存在的标签名」是静默丢弃（加标签接口照样返回 201），所以必须先确保标签存在。
+   */
+  private async syncLabelsToGitee(
+    repoMapping: RepositoryMapping,
+    giteeIssueNumber: string,
+    labels: Array<{ name: string; color?: string }>,
+    mode: 'set' | 'add'
+  ): Promise<Result<string[]>> {
+    try {
+      const wanted = (labels || []).filter(
+        (label) => label && typeof label.name === 'string' && label.name.length > 0
+      );
+      if (wanted.length === 0) {
+        return { success: true, data: [] };
+      }
+
+      const ensureResult = await this.giteeService.ensureRepoLabels(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        wanted.map((label) => ({ name: label.name, color: label.color }))
+      );
+      if (!ensureResult.success) {
+        return { success: false, error: ensureResult.error };
+      }
+
+      const names = ensureResult.data!;
+      if (names.length === 0) {
+        return { success: true, data: [] };
+      }
+
+      const writeResult =
+        mode === 'set'
+          ? await this.giteeService.setIssueLabels(
+              repoMapping.gitee_owner,
+              repoMapping.gitee_repo,
+              giteeIssueNumber,
+              names
+            )
+          : await this.giteeService.addIssueLabels(
+              repoMapping.gitee_owner,
+              repoMapping.gitee_repo,
+              giteeIssueNumber,
+              names
+            );
+      if (!writeResult.success) {
+        return { success: false, error: writeResult.error };
+      }
+
+      return { success: true, data: names };
+    } catch (error) {
+      return { success: false, error: `同步标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 处理 GitHub 的 labeled / unlabeled 事件（同步到 Gitee）
+   */
+  private async handleGitHubLabelChange(event: any, eventId: string): Promise<Result<string>> {
+    try {
+      const issueNumber = event.issue?.number;
+      const labelName = event.label?.name;
+      if (!issueNumber || !labelName) {
+        return { success: false, error: '事件缺少 issue 或 label 信息' };
+      }
+
+      const [githubOwner, githubRepo] = event.repository.full_name.split('/');
+      const repoMapping = await this.getRepositoryMappingByGithub(githubOwner, githubRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
+      }
+
+      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      if (!issueMapping) {
+        console.warn(`GitHub #${issueNumber} 没有映射记录，跳过标签同步`);
+        return { success: true, data: `GitHub #${issueNumber} 没有同步记录，跳过标签同步` };
+      }
+      if (!issueMapping.gitee_issue_number) {
+        return { success: false, error: '找不到对应的Gitee Issue编号' };
+      }
+
+      const giteeNumber = issueMapping.gitee_issue_number;
+
+      if (event.action === 'unlabeled') {
+        const removeResult = await this.giteeService.removeIssueLabels(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          giteeNumber,
+          [labelName]
+        );
+        if (!removeResult.success) {
+          return { success: false, error: removeResult.error };
+        }
+        await this.saveWebhookEvent(eventId, 'label_remove', 'github');
+        return { success: true, data: `已从 Gitee ${giteeNumber} 移除标签 ${labelName}` };
+      }
+
+      const addResult = await this.syncLabelsToGitee(
+        repoMapping,
+        giteeNumber,
+        [{ name: labelName, color: event.label?.color }],
+        'add'
+      );
+      if (!addResult.success) {
+        return { success: false, error: addResult.error };
+      }
+      if (addResult.data!.length === 0) {
+        return {
+          success: true,
+          data: `标签 ${labelName} 无法在 Gitee 创建（名字不符合 Gitee 规则），跳过`,
+        };
+      }
+
+      await this.saveWebhookEvent(eventId, 'label_add', 'github');
+      return { success: true, data: `已给 Gitee ${giteeNumber} 加标签 ${labelName}` };
+    } catch (error) {
+      return { success: false, error: `处理GitHub标签变更异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
    * 一次性回灌：把 GitHub 侧还没有映射记录的 issue 补建到 Gitee。
    * 同步是事件驱动的，功能上线前就已经存在的 GitHub issue 不会被追溯，用这个接口补齐。
    * 关键顺序：建完 issue 立刻写 issue_mappings —— Gitee 会马上回传 open 事件，
@@ -485,7 +627,8 @@ export class SyncService {
   async backfillGitHubIssuesToGitee(
     repositoryId?: number,
     dryRun = false,
-    limit = 4
+    limit = 4,
+    mode: 'issues' | 'labels' = 'issues'
   ): Promise<Result<{ processed: number; remaining: number; results: any[] }>> {
     try {
       const allMappings = await this.getAllRepositoryMappings();
@@ -498,7 +641,7 @@ export class SyncService {
       }
 
       const results: any[] = [];
-      const queue: Array<{ repoMapping: RepositoryMapping; issue: any }> = [];
+      const queue: Array<{ repoMapping: RepositoryMapping; issue: any; existing?: IssueMapping }> = [];
 
       for (const repoMapping of repoMappings) {
         const listResult = await this.githubService.listIssues(
@@ -516,7 +659,26 @@ export class SyncService {
 
         for (const issue of listResult.data!) {
           const existing = await this.getIssueMappingByGithub(issue.number, repoMapping.id);
-          if (!existing) {
+          if (mode === 'labels') {
+            // labels 模式只处理已经成对的 issue：把 GitHub 的标签补齐到 Gitee
+            // 已经一致的直接不入队，这样反复调用才会向前推进（否则永远卡在队首几条）
+            if (existing) {
+              const currentLabels = await this.giteeService.getIssueLabels(
+                repoMapping.gitee_owner,
+                repoMapping.gitee_repo,
+                existing.gitee_issue_number
+              );
+              const wantedNames = (issue.labels || []).map((label: any) => label.name).sort();
+              const currentNames = (currentLabels.data || []).map((label) => label.name).sort();
+              const sameLabels =
+                currentLabels.success &&
+                wantedNames.length === currentNames.length &&
+                wantedNames.every((name: string, index: number) => name === currentNames[index]);
+              if (!sameLabels) {
+                queue.push({ repoMapping, issue, existing });
+              }
+            }
+          } else if (!existing) {
             queue.push({ repoMapping, issue });
           }
         }
@@ -525,7 +687,44 @@ export class SyncService {
       const batch = queue.slice(0, Math.max(1, limit));
       let processed = 0;
 
-      for (const { repoMapping, issue } of batch) {
+      for (const { repoMapping, issue, existing } of batch) {
+        if (mode === 'labels') {
+          if (!existing?.gitee_issue_number) {
+            results.push({
+              github_issue: `#${issue.number}`,
+              title: issue.title,
+              action: 'skipped',
+              detail: '缺少 Gitee 编号',
+            });
+            continue;
+          }
+          if (dryRun) {
+            results.push({
+              github_issue: `#${issue.number}`,
+              gitee_issue: existing.gitee_issue_number,
+              labels: (issue.labels || []).map((l: any) => l.name),
+              action: 'would_apply_labels',
+            });
+            continue;
+          }
+          const labelResult = await this.syncLabelsToGitee(
+            repoMapping,
+            existing.gitee_issue_number,
+            issue.labels || [],
+            'set'
+          );
+          processed += 1;
+          results.push({
+            github_issue: `#${issue.number}`,
+            gitee_issue: existing.gitee_issue_number,
+            action: labelResult.success ? 'labels_synced' : 'error',
+            labels: labelResult.data || [],
+            detail: labelResult.success ? undefined : labelResult.error,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          continue;
+        }
+
         if (dryRun) {
           results.push({
             github_issue: `#${issue.number}`,
@@ -568,6 +767,14 @@ export class SyncService {
           github_url: issue.html_url,
         });
 
+        // 顺带把标签复制过去（Gitee 里没有的会先建同名同色）
+        const labelResult = await this.syncLabelsToGitee(
+          repoMapping,
+          String(giteeIssue.number),
+          issue.labels || [],
+          'set'
+        );
+
         let stateSynced: boolean | null = null;
         if (issue.state === 'closed') {
           const stateResult = await this.giteeService.updateIssueState(
@@ -589,6 +796,8 @@ export class SyncService {
           title: issue.title,
           state: issue.state,
           state_synced: stateSynced,
+          labels: labelResult.success ? labelResult.data : [],
+          labels_error: labelResult.success ? undefined : labelResult.error,
           action: 'created',
         });
 

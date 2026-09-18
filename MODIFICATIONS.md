@@ -79,6 +79,17 @@ curl -X POST https://<域>/api/backfill \
 - Worker 有执行时长限制，`limit` 建议 3-5，反复调用直到 `remaining` 为 0（接口会把剩余条数返回）。
 - 实测：12 条历史 issue（#2-#10、#12、#13、#15）一次灌完，Gitee 侧 15 条与 GitHub 侧一一对应，GitHub 侧没有多出任何一条（防重复逻辑在真实事件下生效 12 次）。
 
+### 8. 标签同步（GitHub → Gitee，新增）
+
+- **范围**：GitHub 建 issue 时复制标签、`labeled` / `unlabeled` 事件同步、`POST /api/backfill` 的 `{"mode":"labels"}` 用来补齐历史成对 issue 的标签（幂等，反复调用直到 `remaining` 为 0）。
+- Gitee 的标签接口很挑，三个坑：
+  1. 给 issue 加／替换标签的 body 是**裸数组** `["bug","feature"]`；写成 `{"labels":[...]}` 会 `Problems parsing JSON`。
+  2. 创建**仓库标签**却要 **form 编码**（`name=...&color=...`）；发 JSON 会报“名字不合法”，其实是因为 JSON 没被解析、name 为空。
+  3. **仓库里不存在的标签名会被静默丢弃**：加标签接口照样返回 201，但标签根本没加上（实测 `good first issue` 就是被吃掉的）。所以同步前必须先确保标签存在——本副本的 `ensureRepoLabels` 会按 GitHub 的名字与颜色自动建。
+- 标签名限制：2-20 个字符，只允许汉字/字母/数字/`.`/`_`/`-`/`/`/`\` 与全角符号。名字不合法的（例如 GitHub 上常见的 `type: bug`）会被跳过并写日志，不影响同一事件里的其它同步。
+- 两边标签集原本不同：GitHub 多出 accessibility / documentation / good first issue / help wanted，Gitee 多出 feature。当前策略是“缺失就按 GitHub 的名字与颜色在 Gitee 建一个”，因此补齐后 Gitee 侧标签集会向 GitHub 靠拢（实测已自动建出 accessibility、documentation）。
+- **Gitee → GitHub 方向的标签同步未实现**：Gitee 是否在标签变化时投递 webhook 尚未验证；而且它的 API 改动一律不触发 webhook（见第 6 节）。
+
 ## 部署踩坑记录
 
 1. **workers.dev 在国内不可用** —— 必须绑定自定义域名，否则 Gitee 的 Webhook 一定超时（症状：Gitee 后台显示请求超时/失败）。
@@ -126,5 +137,6 @@ curl -X POST https://<域>/api/backfill \
 | 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
+| 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。

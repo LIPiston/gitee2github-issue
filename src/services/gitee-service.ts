@@ -3,7 +3,8 @@
  * 改动：1) Gitee 密码校验加固（未配置 GITEE_WEBHOOK_SECRET 即拒绝，长度校验 + 常量时间比较）；
  *      2) 创建评论遇到 404 时返回「Gitee 端可能已删除该 issue」的诊断信息并记录日志；
  *      3) 创建/更新 issue 改用 owner 级路径 /repos/{owner}/issues[/{number}] + 表单编码
- *         （旧的 /repos/{owner}/{repo}/issues 写操作已失效，只返回 404 project or enterprise）。
+ *         （旧的 /repos/{owner}/{repo}/issues 写操作已失效，只返回 404 project or enterprise）；
+ *      4) 新增标签相关方法（加/换/删 issue 标签、读仓库标签、按 GitHub 名字与颜色补建标签）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeIssue, GiteeComment } from '../types';
@@ -192,6 +193,220 @@ export class GiteeService {
       return { success: true, data: true };
     } catch (error) {
       return { success: false, error: `更新Gitee Issue状态异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 读取某个 Issue 上的标签
+   */
+  async getIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: string
+  ): Promise<Result<Array<{ name: string; color?: string }>>> {
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues/${issueNumber}/labels`,
+        {
+          headers: { 'Authorization': `token ${this.token}`, 'Accept': 'application/json' },
+        }
+      );
+      if (!response.ok) {
+        return { success: false, error: `读取Gitee Issue标签失败: HTTP ${response.status}` };
+      }
+      const labels = (await response.json()) as Array<{ name: string; color?: string }>;
+      return { success: true, data: Array.isArray(labels) ? labels : [] };
+    } catch (error) {
+      return { success: false, error: `读取Gitee Issue标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 给 Issue 加标签（Gitee 这个接口的 body 是裸数组 ["bug","feature"]，不是对象）
+   */
+  async addIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: string,
+    names: string[]
+  ): Promise<Result<boolean>> {
+    if (names.length === 0) {
+      return { success: true, data: true };
+    }
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues/${issueNumber}/labels`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `token ${this.token}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(names),
+        }
+      );
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`给 Gitee Issue 加标签失败: ${owner}/${repo} ${issueNumber} ${names.join(',')} HTTP ${response.status} ${error}`);
+        return { success: false, error: `给Gitee Issue加标签失败: HTTP ${response.status} ${error}` };
+      }
+      return { success: true, data: true };
+    } catch (error) {
+      return { success: false, error: `给Gitee Issue加标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 替换 Issue 的全部标签（同样是裸数组 body）
+   */
+  async setIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: string,
+    names: string[]
+  ): Promise<Result<boolean>> {
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues/${issueNumber}/labels`,
+        {
+          method: 'PUT',
+          headers: {
+            'Authorization': `token ${this.token}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(names),
+        }
+      );
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`替换 Gitee Issue 标签失败: ${owner}/${repo} ${issueNumber} HTTP ${response.status} ${error}`);
+        return { success: false, error: `替换Gitee Issue标签失败: HTTP ${response.status} ${error}` };
+      }
+      return { success: true, data: true };
+    } catch (error) {
+      return { success: false, error: `替换Gitee Issue标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 删除 Issue 上的标签（name 支持逗号分隔批量删除）
+   */
+  async removeIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: string,
+    names: string[]
+  ): Promise<Result<boolean>> {
+    if (names.length === 0) {
+      return { success: true, data: true };
+    }
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(names.join(','))}`,
+        {
+          method: 'DELETE',
+          headers: { 'Authorization': `token ${this.token}`, 'Accept': 'application/json' },
+        }
+      );
+      // 标签本来就不在 issue 上时 Gitee 会返回 404，这种情况按成功处理
+      if (!response.ok && response.status !== 404) {
+        const error = await response.text();
+        console.error(`删除 Gitee Issue 标签失败: ${owner}/${repo} ${issueNumber} ${names.join(',')} HTTP ${response.status} ${error}`);
+        return { success: false, error: `删除Gitee Issue标签失败: HTTP ${response.status} ${error}` };
+      }
+      return { success: true, data: true };
+    } catch (error) {
+      return { success: false, error: `删除Gitee Issue标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 读取仓库的所有标签
+   */
+  async listRepoLabels(owner: string, repo: string): Promise<Result<Array<{ name: string; color?: string }>>> {
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/labels`,
+        {
+          headers: { 'Authorization': `token ${this.token}`, 'Accept': 'application/json' },
+        }
+      );
+      if (!response.ok) {
+        return { success: false, error: `读取Gitee仓库标签失败: HTTP ${response.status}` };
+      }
+      const labels = (await response.json()) as Array<{ name: string; color?: string }>;
+      return { success: true, data: Array.isArray(labels) ? labels : [] };
+    } catch (error) {
+      return { success: false, error: `读取Gitee仓库标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 创建仓库标签。注意这个接口要 **form 编码**（JSON 会被当成没传 name 而报错）。
+   */
+  async createRepoLabel(owner: string, repo: string, name: string, color?: string): Promise<Result<boolean>> {
+    try {
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/${repo}/labels`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `token ${this.token}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+          },
+          body: new URLSearchParams({ name, color: (color || 'ededed').replace(/^#/, '') }).toString(),
+        }
+      );
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`创建 Gitee 仓库标签失败: ${owner}/${repo} ${name} HTTP ${response.status} ${error}`);
+        return { success: false, error: `创建Gitee仓库标签失败: HTTP ${response.status} ${error}` };
+      }
+      return { success: true, data: true };
+    } catch (error) {
+      return { success: false, error: `创建Gitee仓库标签异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 确保标签在 Gitee 仓库里存在；不存在就按 GitHub 的名字和颜色建一个。
+   * Gitee 对不存在的标签名是「静默丢弃」（加标签接口照样返回 201），所以必须先建。
+   */
+  async ensureRepoLabels(
+    owner: string,
+    repo: string,
+    wanted: Array<{ name: string; color?: string }>
+  ): Promise<Result<string[]>> {
+    try {
+      const existingResult = await this.listRepoLabels(owner, repo);
+      if (!existingResult.success) {
+        return { success: false, error: existingResult.error };
+      }
+
+      const existing = new Set(existingResult.data!.map((l) => l.name));
+      const applied: string[] = [];
+
+      for (const label of wanted) {
+        if (existing.has(label.name)) {
+          applied.push(label.name);
+          continue;
+        }
+        const createResult = await this.createRepoLabel(owner, repo, label.name, label.color);
+        if (createResult.success) {
+          existing.add(label.name);
+          applied.push(label.name);
+        } else {
+          // 名字不合法（Gitee 只允许 2-20 位特定字符）或权限不足：跳过这个标签，不影响其它同步
+          console.warn(`跳过无法在 Gitee 创建的标签: ${label.name} —— ${createResult.error}`);
+        }
+      }
+
+      return { success: true, data: applied };
+    } catch (error) {
+      return { success: false, error: `同步Gitee标签异常: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
