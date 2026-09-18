@@ -47,6 +47,21 @@
 node scripts/encode-github-app-key.mjs /path/to/pkcs8-private-key.pem | npx wrangler secret put GITHUB_PRIVATE_KEY
 ```
 
+### 6. Gitee 写 issue 的接口路径已变更（上游与各种教程都过时了）
+
+Gitee 把「创建 / 更新 issue」的接口从 `/repos/{owner}/{repo}/issues[/{number}]` 挪到了 **owner 级**：
+
+- 创建：`POST https://gitee.com/api/v5/repos/{owner}/issues`，表单字段带 `repo=<仓库路径>`、`title`、`body`
+- 更新：`PATCH https://gitee.com/api/v5/repos/{owner}/issues/{number}`，表单字段带 `repo`、`state`（枚举只有 `open` / `progressing` / `closed`）
+- 两者都是 `application/x-www-form-urlencoded`，不是 JSON
+
+旧路径现在**只保留 GET**（issue 列表与详情照常用），任何写操作都会返回
+`404 {"message":"project or enterprise"}`。这句话极具误导性——看起来像“仓库不存在”或“权限不足”，实际是路由已经不存在了；对照实验可以证明：拿一个不存在的仓库发同样的 POST，返回的是完全相同的这句话。
+
+排查这类问题的正解：`GET https://gitee.com/api/v5/swagger_doc` 就是 Gitee 官方的 Swagger JSON（约 336 KB，直接可读），查 `paths` 即可确认当前真实路径与参数，不要去猜。
+
+另外实测：**通过 API 修改 Gitee issue 状态不会触发 Gitee 的 webhook**（改了状态后 30 秒内没有任何投递）。所以 Gitee → GitHub 方向只对网页 / 人工操作生效，用 API 改 Gitee 状态不会回流到 GitHub。
+
 ## 部署踩坑记录
 
 1. **workers.dev 在国内不可用** —— 必须绑定自定义域名，否则 Gitee 的 Webhook 一定超时（症状：Gitee 后台显示请求超时/失败）。
@@ -59,6 +74,9 @@ node scripts/encode-github-app-key.mjs /path/to/pkcs8-private-key.pem | npx wran
 5. **D1 外键约束**：`issue_mappings` 被 `comment_mappings.issue_id` 引用，删除映射前必须先删依赖的 `comment_mappings` 行，否则报 `SQLITE_CONSTRAINT_FOREIGNKEY`。
 6. **GitHub App 的投递明细看不到响应体**：`GET /app/hook/deliveries/{id}` 只返回响应头，Worker 返回的具体错误信息只能从自己的日志里看。
 7. **事件范围**（本副本已扩展）：issue 创建双向、评论双向、关闭/重开双向；标题与正文的后续编辑不同步；删除不同步（Gitee 端删除会留下映射，见第 3 节 404 诊断）。
+8. **Gitee 的权限不足同样伪装成 404**：令牌缺 `issues` 权限时，写 issue 返回的还是 404（配合第 6 节的路径问题，会让人误判两次）。快速自检：`GET /api/v5/user/repos` —— 没 `projects` 权限时它会直接说 `401 Unauthorized: no 'projects' scope`；`/user`（user_info）与评论接口（notes）不受影响，所以会出现“能发评论但不能建 issue”这种诡异组合。
+9. **写 Gitee 的接口用表单而不是 JSON**：把 JSON 发给 owner 级接口不会报参数错误，只会失败在别的地方（本次踩坑：路径错的时候 JSON/表单都是一样的 404，路径对了之后必须换成 `x-www-form-urlencoded`）。
+10. **API 改动不触发 Gitee webhook**：用 API 关掉 Gitee issue，GitHub 侧不会跟着变（实测 30 秒无投递）。验收 Gitee → GitHub 方向必须在**网页**上操作，或者回放 webhook。
 
 ## 需要配置的 secrets
 
@@ -78,3 +96,17 @@ node scripts/encode-github-app-key.mjs /path/to/pkcs8-private-key.pem | npx wran
 - 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；同步功能上线之前已经在 GitHub 侧建好的 issue 不会自动回灌到 Gitee，需要手工补齐或写一次性回灌脚本。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。
+
+## 线上验证记录（2026-09-18，Cloudflare Worker 实测）
+
+| 方向 | 操作 | 判据 |
+| --- | --- | --- |
+| Gitee → GitHub | 网页/回放 `issue_hooks open` | 真实 Gitee webhook（hook_id 2127745）建出 GitHub issue 并落库映射 |
+| Gitee → GitHub | 关闭 / 重开 | GitHub issue 状态与 `state_reason` 真的改变 |
+| GitHub → Gitee | 新建 issue | Gitee 出现同名 issue（IKGYNG ↔ #16），正文带来源标注，映射 id=4 |
+| GitHub → Gitee | 关闭 / 重开 | Gitee issue 状态跟着变（closed / open） |
+| GitHub → Gitee | 评论回写 | Gitee 评论 51264768 ↔ GitHub 评论 5730066539 |
+| 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
+| 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
+
+补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。

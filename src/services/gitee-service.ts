@@ -1,7 +1,9 @@
 /**
  * 本文件修改自 OpenSiFli/gitee2github-issue（Apache-2.0，commit 836b381）。
  * 改动：1) Gitee 密码校验加固（未配置 GITEE_WEBHOOK_SECRET 即拒绝，长度校验 + 常量时间比较）；
- *      2) 创建评论遇到 404 时返回「Gitee 端可能已删除该 issue」的诊断信息并记录日志。
+ *      2) 创建评论遇到 404 时返回「Gitee 端可能已删除该 issue」的诊断信息并记录日志；
+ *      3) 创建/更新 issue 改用 owner 级路径 /repos/{owner}/issues[/{number}] + 表单编码
+ *         （旧的 /repos/{owner}/{repo}/issues 写操作已失效，只返回 404 project or enterprise）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeIssue, GiteeComment } from '../types';
@@ -77,20 +79,23 @@ export class GiteeService {
 
   /**
    * 在 Gitee 创建 Issue（GitHub → Gitee 方向）
-   * 需要令牌具备 issues 权限；权限不足时 Gitee 会返回 404（伪装）或 401
+   * 注意路径是 /repos/{owner}/issues（仓库路径放在表单字段 repo 里），
+   * 旧的 /repos/{owner}/{repo}/issues 现在只支持 GET，写操作会返回
+   * 404 {"message":"project or enterprise"}（Gitee 2026 起改成 owner 级路径）
+   * 需要令牌具备 issues 权限
    */
   async createIssue(owner: string, repo: string, title: string, body: string): Promise<Result<GiteeIssue>> {
     try {
       const response = await fetch(
-        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues`,
+        `https://gitee.com/api/v5/repos/${owner}/issues`,
         {
           method: 'POST',
           headers: {
             'Authorization': `token ${this.token}`,
-            'Content-Type': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
             'Accept': 'application/json',
           },
-          body: JSON.stringify({ title, body }),
+          body: new URLSearchParams({ repo, title, body }).toString(),
         }
       );
 
@@ -102,7 +107,7 @@ export class GiteeService {
             success: false,
             error:
               `创建Gitee Issue失败: HTTP ${response.status} ${error}` +
-              `（通常是 Gitee 令牌缺少 issues 权限，或该仓库不允许写入）`,
+              `（通常是 Gitee 令牌缺少 issues 权限，或仓库路径 repo 字段写错）`,
           };
         }
         return { success: false, error: `创建Gitee Issue失败: ${error}` };
@@ -145,7 +150,8 @@ export class GiteeService {
 
   /**
    * 更新 Gitee Issue 状态（open / closed）
-   * Gitee 的状态值还有 progressing / rejected，这里只用到 open 与 closed
+   * 路径同样是 owner 级：/repos/{owner}/issues/{number}，仓库路径放在表单字段 repo 里
+   * Gitee 允许的 state：open / progressing / closed
    */
   async updateIssueState(
     owner: string,
@@ -155,15 +161,15 @@ export class GiteeService {
   ): Promise<Result<boolean>> {
     try {
       const response = await fetch(
-        `https://gitee.com/api/v5/repos/${owner}/${repo}/issues/${issueNumber}`,
+        `https://gitee.com/api/v5/repos/${owner}/issues/${issueNumber}`,
         {
           method: 'PATCH',
           headers: {
             'Authorization': `token ${this.token}`,
-            'Content-Type': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
             'Accept': 'application/json',
           },
-          body: JSON.stringify({ state }),
+          body: new URLSearchParams({ repo, state }).toString(),
         }
       );
 

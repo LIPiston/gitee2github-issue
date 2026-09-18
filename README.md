@@ -4,7 +4,7 @@
 ![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
 ![Cloudflare Workers](https://img.shields.io/badge/Cloudflare_Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)
 
-> **本副本说明**：这是 [LIPiston](https://github.com/LIPiston) 基于 [OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（commit `836b381`）做的部署实践副本，补上了自定义域名路由、GitHub Webhook 的 HMAC 签名校验、按目标仓库动态获取安装令牌，以及若干部署踩坑修复。
+> **本副本说明**：这是 [LIPiston](https://github.com/LIPiston) 基于 [OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（commit `836b381`）做的部署实践副本，补上了自定义域名路由、GitHub Webhook 的 HMAC 签名校验、按目标仓库动态获取安装令牌，并把同步范围扩展成**双向的 issue 创建 / 评论 / 关闭 / 重开**（上游 GitHub 侧新建 issue 被跳过、关闭与重开完全不处理），另有若干部署踩坑修复。
 > 改动清单、部署注意事项与已验证的行为见 [MODIFICATIONS.md](./MODIFICATIONS.md)。
 > 上游以 **Apache-2.0 License** 授权（见上游 README「📄 许可证」段落，仓库内未附 LICENSE 文件）；本副本沿用 Apache-2.0，并已按该许可证第 4(b) 条在 [MODIFICATIONS.md](./MODIFICATIONS.md) 中声明了对文件的修改，许可证正文见 [LICENSE](./LICENSE)。
 > 克隆本副本：`git clone https://github.com/LIPiston/gitee2github-issue.git`
