@@ -90,6 +90,14 @@ curl -X POST https://<域>/api/backfill \
 - 两边标签集原本不同：GitHub 多出 accessibility / documentation / good first issue / help wanted，Gitee 多出 feature。当前策略是“缺失就按 GitHub 的名字与颜色在 Gitee 建一个”，因此补齐后 Gitee 侧标签集会向 GitHub 靠拢（实测已自动建出 accessibility、documentation）。
 - **Gitee → GitHub 方向的标签同步未实现**：Gitee 是否在标签变化时投递 webhook 尚未验证；而且它的 API 改动一律不触发 webhook（见第 6 节）。
 
+### 9. 标题 / 正文编辑同步（GitHub → Gitee，新增）
+
+- **触发**：GitHub 的 `issues.edited` 事件，只处理 `changes` 里带 `title` 或 `body` 的编辑（改里程碑、置顶等同样会发 `issues.edited`，那些不含这两个字段，直接跳过）。
+- **实现**：owner 级 `PATCH /repos/{owner}/issues/{number}`，表单字段 `repo` + 需要改的 `title`/`body`；改正文时会重新套用与创建时一致的来源标注（尾部 footer 不会被吃掉）。
+- **为什么补**：这条路径原来完全没处理，而且很容易被误判成「回灌/创建流程有 bug」。实测案例：GitHub #19 创建时标题只有模板前缀 `[Bug]:`（issue 模板预填），作者 6 分钟后补全了标题；GitHub 侧显示正常，Gitee 侧永远停在 `[Bug]:`。看 GitHub 的 issue 时间线能直接定位：`renamed '[Bug]:' -> '[Bug]:数据采集…' @15:24:14`，而 Gitee 镜像创建于 `15:18:27`（open 事件后 6 秒）——**同步当时的标题就是 `[Bug]:`，创建流程没有错，缺的是编辑同步**。
+- **回环风险**：无。用 API 改 Gitee 不触发它自己的 webhook（见第 6 节）。
+- **未实现**：Gitee → GitHub 方向的编辑同步。Gitee 是否在编辑时投递 webhook、action 与载荷结构都还没观测到，等抓到真实事件再补。
+
 ## 部署踩坑记录
 
 1. **workers.dev 在国内不可用** —— 必须绑定自定义域名，否则 Gitee 的 Webhook 一定超时（症状：Gitee 后台显示请求超时/失败）。
@@ -105,6 +113,7 @@ curl -X POST https://<域>/api/backfill \
 8. **Gitee 的权限不足同样伪装成 404**：令牌缺 `issues` 权限时，写 issue 返回的还是 404（配合第 6 节的路径问题，会让人误判两次）。快速自检：`GET /api/v5/user/repos` —— 没 `projects` 权限时它会直接说 `401 Unauthorized: no 'projects' scope`；`/user`（user_info）与评论接口（notes）不受影响，所以会出现“能发评论但不能建 issue”这种诡异组合。
 9. **写 Gitee 的接口用表单而不是 JSON**：把 JSON 发给 owner 级接口不会报参数错误，只会失败在别的地方（本次踩坑：路径错的时候 JSON/表单都是一样的 404，路径对了之后必须换成 `x-www-form-urlencoded`）。
 10. **API 改动不触发 Gitee webhook**：用 API 关掉 Gitee issue，GitHub 侧不会跟着变（实测 30 秒无投递）。验收 Gitee → GitHub 方向必须在**网页**上操作，或者回放 webhook。
+11. **「同步过去的内容不一致」先查 GitHub 的 issue 时间线，别先怀疑回灌**：Gitee 镜像标题只剩 `[Bug]:` 那次，`GET /repos/{owner}/{repo}/issues/{n}/timeline` 直接给出答案——`labeled @15:18:22`、`renamed '[Bug]:' -> '[Bug]:数据采集…' @15:24:14`，而镜像创建于 `15:18:27`。结论是「同步那一刻的标题就是这样，之后 6 分钟的编辑没人同步」。排查这类问题要先对齐两侧时间线，再判断是漏同步还是时序问题，否则会在回灌流程里白翻半天。
 
 ## 需要配置的 secrets
 
@@ -120,7 +129,8 @@ curl -X POST https://<域>/api/backfill \
 
 ## 已知待改进
 
-- 标题 / 正文的后续编辑不同步（只处理创建、评论、关闭、重开）。
+- Gitee → GitHub 方向的标题/正文编辑不同步（GitHub → Gitee 已实现，见第 9 节；反向需要先抓到 Gitee 的编辑事件）。
+- Gitee 端删除 issue 或修改标题后的映射状态不主动校验（映射表只在创建时写入）。
 - 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；上线前已在 GitHub 侧建好的 issue 用 `POST /api/backfill`（见第 7 节）补，并且接口本身也没有节流重试。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。
@@ -138,5 +148,6 @@ curl -X POST https://<域>/api/backfill \
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 | 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |
+| 编辑 | GitHub → Gitee | `issues.edited` 同步标题与正文：真实事件改 #17 正文后 Gitee IKGYR7 正文跟随（尾部来源标注保留）；#19 的标题用签名事件补齐，Gitee IKGYZA 由 `[Bug]:` 变为完整标题 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。

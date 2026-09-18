@@ -4,7 +4,8 @@
  *      2) 两侧关闭/重开状态双向同步，写前比对目标端状态以抑制事件回环；
  *      3) 建 issue 前查映射防止重复创建；无映射的事件软跳过（2xx）而非报 400；
  *      4) 标签同步（GitHub → Gitee）：创建时复制、labeled/unlabeled 事件、回灌补齐；
- *      5) 新增回灌方法（把 GitHub 侧历史 issue 补建到 Gitee，或只补齐标签）。
+ *      5) 新增回灌方法（把 GitHub 侧历史 issue 补建到 Gitee，或只补齐标签）；
+ *      6) 处理 issues.edited：把标题/正文的后续编辑同步到 Gitee（只认 changes 里带 title/body 的编辑）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeWebhookEvent, RepositoryMapping, IssueMapping } from '../types';
@@ -89,6 +90,9 @@ export class SyncService {
       } else if (eventType === 'issues' && ['labeled', 'unlabeled'].includes(event.action)) {
         // GitHub 增删标签 -> 同步到 Gitee
         return await this.handleGitHubLabelChange(event, eventId);
+      } else if (eventType === 'issues' && event.action === 'edited') {
+        // 标题 / 正文的后续编辑（例如先建 issue 再补全标题、改错字）
+        return await this.handleGitHubIssueEdit(event, eventId);
       } else if (eventType === 'issue_comment' && event.action === 'created') {
         // 处理Issue评论事件
         return await this.handleGitHubNewComment(event, eventId);
@@ -492,6 +496,69 @@ export class SyncService {
       };
     } catch (error) {
       return { success: false, error: `处理GitHub Issue状态变更异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 处理GitHub Issue 标题/正文编辑事件（同步到 Gitee）
+   * issues.edited 也会因改里程碑、置顶等触发，那些情况不含 changes.title/body，直接跳过
+   */
+  private async handleGitHubIssueEdit(event: any, eventId: string): Promise<Result<string>> {
+    try {
+      const changes = event.changes || {};
+      const titleChanged = Boolean(changes.title);
+      const bodyChanged = Boolean(changes.body);
+      if (!titleChanged && !bodyChanged) {
+        return { success: true, data: '编辑事件不涉及标题或正文，跳过' };
+      }
+
+      const issueNumber = event.issue.number;
+      const [githubOwner, githubRepo] = event.repository.full_name.split('/');
+      const repoMapping = await this.getRepositoryMappingByGithub(githubOwner, githubRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
+      }
+
+      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      if (!issueMapping || !issueMapping.gitee_issue_number) {
+        // 非同步创建的 issue：软跳过（返回 2xx），避免 GitHub 记为投递失败
+        console.warn(`GitHub #${issueNumber} 没有映射记录，跳过标题/正文同步`);
+        return { success: true, data: `GitHub #${issueNumber} 没有同步记录（非同步创建的 issue），跳过` };
+      }
+
+      const patch: { title?: string; body?: string } = {};
+      if (titleChanged) {
+        patch.title = event.issue.title;
+      }
+      if (bodyChanged) {
+        // Gitee 侧的正文保持与创建时相同的格式（尾部带来源标注）
+        patch.body = this.githubService.formatIssueBody(
+          event.issue.body || '',
+          event.issue.html_url,
+          event.issue.user?.login || 'unknown'
+        );
+      }
+
+      const updateResult = await this.giteeService.updateIssueContent(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        issueMapping.gitee_issue_number,
+        patch
+      );
+      if (!updateResult.success) {
+        return { success: false, error: updateResult.error };
+      }
+
+      await this.saveWebhookEvent(eventId, 'issue_edited', 'github');
+      const what = [titleChanged ? '标题' : null, bodyChanged ? '正文' : null]
+        .filter(Boolean)
+        .join('与');
+      return {
+        success: true,
+        data: `已同步 GitHub #${issueNumber} 的${what}修改到 Gitee ${issueMapping.gitee_issue_number}`,
+      };
+    } catch (error) {
+      return { success: false, error: `处理GitHub Issue编辑异常: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 

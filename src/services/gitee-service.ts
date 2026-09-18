@@ -4,7 +4,8 @@
  *      2) 创建评论遇到 404 时返回「Gitee 端可能已删除该 issue」的诊断信息并记录日志；
  *      3) 创建/更新 issue 改用 owner 级路径 /repos/{owner}/issues[/{number}] + 表单编码
  *         （旧的 /repos/{owner}/{repo}/issues 写操作已失效，只返回 404 project or enterprise）；
- *      4) 新增标签相关方法（加/换/删 issue 标签、读仓库标签、按 GitHub 名字与颜色补建标签）。
+ *      4) 新增标签相关方法（加/换/删 issue 标签、读仓库标签、按 GitHub 名字与颜色补建标签）；
+ *      5) 新增 updateIssueContent（owner 级 PATCH 同步标题/正文的后续编辑）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeIssue, GiteeComment } from '../types';
@@ -193,6 +194,53 @@ export class GiteeService {
       return { success: true, data: true };
     } catch (error) {
       return { success: false, error: `更新Gitee Issue状态异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 更新 Gitee Issue 的标题 / 正文（未传入的字段保持不动）
+   * 和状态更新走同一个 owner 级接口：PATCH /repos/{owner}/issues/{number} + 表单编码
+   * 注意：用 API 改 Gitee 不会触发它自己的 webhook，所以这里不存在回环风险
+   */
+  async updateIssueContent(
+    owner: string,
+    repo: string,
+    issueNumber: string,
+    patch: { title?: string; body?: string }
+  ): Promise<Result<boolean>> {
+    try {
+      const form = new URLSearchParams({ repo });
+      if (patch.title !== undefined) {
+        form.set('title', patch.title);
+      }
+      if (patch.body !== undefined) {
+        form.set('body', patch.body);
+      }
+
+      const response = await fetch(
+        `https://gitee.com/api/v5/repos/${owner}/issues/${issueNumber}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Authorization': `token ${this.token}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+          },
+          body: form.toString(),
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(
+          `更新 Gitee Issue 标题/正文失败: ${owner}/${repo} ${issueNumber} HTTP ${response.status} ${error}`
+        );
+        return { success: false, error: `更新Gitee Issue标题/正文失败: HTTP ${response.status} ${error}` };
+      }
+
+      return { success: true, data: true };
+    } catch (error) {
+      return { success: false, error: `更新Gitee Issue标题/正文异常: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
