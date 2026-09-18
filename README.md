@@ -4,6 +4,11 @@
 ![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
 ![Cloudflare Workers](https://img.shields.io/badge/Cloudflare_Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)
 
+> **本副本说明**：这是 [LIPiston](https://github.com/LIPiston) 基于 [OpenSiFli/gitee2github-issue](https://github.com/OpenSiFli/gitee2github-issue)（commit `836b381`）做的部署实践副本，补上了自定义域名路由、GitHub Webhook 的 HMAC 签名校验、按目标仓库动态获取安装令牌，以及若干部署踩坑修复。
+> 改动清单、部署注意事项与已验证的行为见 [MODIFICATIONS.md](./MODIFICATIONS.md)。
+> 上游仓库未附带开源许可证，本副本不额外声明许可；用于生产或二次分发前请先联系上游作者。
+> 克隆本副本：`git clone https://github.com/LIPiston/gitee2github-issue.git`
+
 一个自动化工具，用于在Gitee和GitHub之间同步Issues和评论。当Gitee仓库中创建了新的Issue或添加了评论，它们会自动同步到对应的GitHub仓库，反之亦然。
 
 ## 📝 功能特点

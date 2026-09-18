@@ -7,6 +7,18 @@
 	"name": "gitee2github-issue",
 	"main": "src/index.ts",
 	"compatibility_date": "2023-11-01",
+
+	/**
+	 * 自定义域名路由：workers.dev 在中国大陆被 DNS 污染/屏蔽，
+	 * Gitee 的 Webhook 服务器无法访问，必须走自建域名
+	 */
+	"routes": [
+		{
+			"pattern": "gitee.lipiston.eu.org",
+			"custom_domain": true
+		}
+	],
+
 	"observability": {
 		"enabled": true
 	},
@@ -18,7 +30,7 @@
 		{
 			"binding": "DB",
 			"database_name": "gitee2github_db",
-			"database_id": "83daab30-6e1e-438d-80e6-638fb0b49487"
+			"database_id": "517734d2-8c75-4d52-86af-151b2ce360e8"
 		}
 	],
 
