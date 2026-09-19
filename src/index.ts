@@ -221,7 +221,7 @@ export default {
    */
   async scheduled(controller, env, ctx): Promise<void> {
     const syncService = new SyncService(env);
-    const result = await syncService.cronReconcile(20);
+    const result = await syncService.cronReconcile(40);
     if (!result.success) {
       console.error('定时对齐失败:', result.error);
       return;

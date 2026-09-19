@@ -35,6 +35,10 @@ export interface IssueMapping {
   gitee_url: string;
   github_url: string;
   created_at: string;
+  /** 上次对齐时 Gitee issue 的 updated_at：用于跳过没变动过的成对 issue（省子请求） */
+  gitee_updated_at?: string | null;
+  /** 上次完整比对的时间（ISO）：超过 FULL_VERIFY_INTERVAL_MS 会强制再完整比一次 */
+  verified_at?: string | null;
 }
 
 // 评论映射类型

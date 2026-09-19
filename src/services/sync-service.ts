@@ -18,9 +18,16 @@ import { GitHubService } from './github-service';
 
 /**
  * 定时对齐的周期，必须与 wrangler.jsonc 里 triggers.crons 的周期保持一致
- * （当前：每 4 小时一次，`0 *​/4 * * *`）。轮转窗口按这个值推进，改成别的周期时要一起改。
+ * （当前：每天 05:00 与 17:00 各一次 = 12 小时）。轮转窗口按这个值推进，改成别的周期时要一起改。
  */
-const CRON_PERIOD_MS = 4 * 60 * 60 * 1000;
+const CRON_PERIOD_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * 一条成对 issue 距上次「完整比对」超过这个时间，就必须再完整比一次
+ * （哪怕 Gitee 的 updated_at 没变）。这是给「GitHub → Gitee 的事件同步偶发失败」兜底：
+ * 那种情况 Gitee 侧没有任何变化，光看 updated_at 会一直跳过，漂移就永远修不回来。
+ */
+const FULL_VERIFY_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export class SyncService {
   private giteeService: GiteeService;
@@ -484,6 +491,27 @@ export class SyncService {
   }
 
   /**
+   * 记录「这条成对 issue 刚做过一次完整比对」：Gitee 的 updated_at + 比对时间。
+   * 下一轮对齐时若 Gitee 侧 updated_at 没变、且上次比对还比较新，就直接跳过
+   * （未改动的成对 issue 只花 1 个子请求，这是能把全部 issue 放进一次调用的关键）。
+   */
+  private async saveIssueReconcileStamp(mappingId: number, giteeUpdatedAt: string): Promise<void> {
+    if (!giteeUpdatedAt) {
+      return;
+    }
+    try {
+      await this.env.DB.prepare(
+        `UPDATE issue_mappings SET gitee_updated_at = ?, verified_at = ? WHERE id = ?`
+      )
+        .bind(giteeUpdatedAt, new Date().toISOString(), mappingId)
+        .run();
+    } catch (error) {
+      // 只是优化用的时间戳，写失败不影响同步本身
+      console.warn(`记录对齐时间戳失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
    * 判断某一行是不是同步来源标注
    */
   private isSyncFooterLine(line: string): boolean {
@@ -549,6 +577,18 @@ export class SyncService {
         return { success: false, error: giteeResult.error };
       }
       const giteeIssue = giteeResult.data!;
+
+      // 省子请求的关键一跳：Gitee 不投递标签/编辑事件，所以「Gitee 侧 updated_at 没变」
+      // 基本就等于「这条没什么要对的」（GitHub → Gitee 方向是事件驱动的，不靠这里兜底）。
+      // 但事件同步偶发失败时 Gitee 也可能没变化，所以每隔 FULL_VERIFY_INTERVAL_MS
+      // 强制完整比对一次，避免漂移被永久跳过。
+      const giteeUpdatedAt = giteeIssue.updated_at || '';
+      const verifiedAt = issueMapping.verified_at ? Date.parse(issueMapping.verified_at) : NaN;
+      const verifiedRecently =
+        Number.isFinite(verifiedAt) && Date.now() - verifiedAt < FULL_VERIFY_INTERVAL_MS;
+      if (giteeUpdatedAt && issueMapping.gitee_updated_at === giteeUpdatedAt && verifiedRecently) {
+        return { success: true, data: [] };
+      }
 
       const githubResult = await this.githubService.getIssue(
         repoMapping.github_owner,
@@ -636,6 +676,9 @@ export class SyncService {
           changed.push(`标签(${ensureResult.data!.join('、') || '清空'})`);
         }
       }
+
+      // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）
+      await this.saveIssueReconcileStamp(issueMapping.id, giteeUpdatedAt);
 
       return { success: true, data: changed };
     } catch (error) {
@@ -733,11 +776,11 @@ export class SyncService {
 
   /**
    * 定时兜底对齐（Cloudflare Cron 触发）：Gitee 侧的标签/标题/正文改动没有 webhook 通知，只能定期拉一遍。
-   * 分班处理：单次调用的子请求数有硬上限（免费版 50），每对 issue 要吃 2~3 个子请求，
-   * 所以一次只扫 perRun 条，窗口按时间轮转（不需要额外存状态），下一班接着扫下一段。
+   * 分班处理：单次调用的子请求数有硬上限（免费版 50）。没改动过的成对 issue 只用 1 个子请求
+   * （读 Gitee 详情 + 比对 updated_at 就返回），所以一次能扫几十条；真变多了会自动按时间轮转分班。
    */
   async cronReconcile(
-    perRun = 20
+    perRun = 40
   ): Promise<Result<{ processed: number; remaining: number; changed: string[]; failed: number }>> {
     try {
       const allMappings = await this.getAllRepositoryMappings();
