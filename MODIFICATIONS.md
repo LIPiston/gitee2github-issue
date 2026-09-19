@@ -130,6 +130,8 @@ curl -X POST https://<域>/api/backfill \
 - **定时兜底**：`wrangler.jsonc` 增加 `triggers.crons = ["*/30 * * * *"]`，每 30 分钟按「时间轮转的 offset」拉一段（10 条/次）回来对齐。任何一条改动最多 30~90 分钟必然收敛，且不需要额外存状态（offset 由当前时间算出）。
 - **手动修**：`POST /api/backfill` 新增 `{"mode":"reconcile","limit":5,"offset":0}`（Bearer `ADMIN_PASSWORD`），用于立刻对齐或修复历史漂移；成对 issue 用若干个窗口跑一遍即可全覆盖（25 条 = 5 个窗口）。
 
+**镜像创建期的竞态（顺带修掉）**：用户「建完 issue 立刻点标签」时，GitHub 的 `labeled` 事件比镜像创建 + 写映射（约 2~3 秒）先到，事件因查不到映射被丢掉——而 GitHub→Gitee 方向没有拉取兜底，这个标签就永远同步不过去。现在 GitHub 侧的处理器（标签 / 编辑 / 状态 / 评论）查不到映射时**等 4 秒再查一次**。实测无映射的探针事件耗时 1.8s → 5.8s，返回仍是软跳过的 200。`opened` 那条（自己负责创建映射）不加这个重试。
+
 **顺带修掉的三个坑**：
 
 1. **状态事件的 action 叫 `state_change`**（不是 `close` / `reopen`）。原来的分支只认 close/reopen，所以**真实 Gitee 关闭/重开从来没有同步过**（早前「验证过」用的是自己回放的签名事件，回放时用的 action 恰好是 close）。现在 `state_change` 也走状态同步，且状态以「读回 Gitee 的当前状态」为准——这类事件只告诉你状态变了，不告诉你是变成 open 还是 closed。

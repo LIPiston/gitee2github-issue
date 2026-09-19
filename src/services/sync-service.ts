@@ -364,7 +364,7 @@ export class SyncService {
       }
 
       // 查找Issue映射关系
-      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      const issueMapping = await this.getIssueMappingByGithubWithRetry(issueNumber, repoMapping.id);
       if (!issueMapping) {
         return { success: false, error: `找不到Issue映射关系: ${issueNumber}` };
       }
@@ -856,7 +856,7 @@ export class SyncService {
         return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
       }
 
-      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      const issueMapping = await this.getIssueMappingByGithubWithRetry(issueNumber, repoMapping.id);
       if (!issueMapping) {
         // 该 GitHub issue 不是从 Gitee 同步来的：软跳过（返回 2xx），避免 GitHub 记为投递失败
         console.warn(`GitHub #${issueNumber} 没有映射记录，跳过状态同步`);
@@ -921,7 +921,7 @@ export class SyncService {
         return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
       }
 
-      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      const issueMapping = await this.getIssueMappingByGithubWithRetry(issueNumber, repoMapping.id);
       if (!issueMapping || !issueMapping.gitee_issue_number) {
         // 非同步创建的 issue：软跳过（返回 2xx），避免 GitHub 记为投递失败
         console.warn(`GitHub #${issueNumber} 没有映射记录，跳过标题/正文同步`);
@@ -1039,7 +1039,7 @@ export class SyncService {
         return { success: false, error: `找不到仓库映射关系: ${githubOwner}/${githubRepo}` };
       }
 
-      const issueMapping = await this.getIssueMappingByGithub(issueNumber, repoMapping.id);
+      const issueMapping = await this.getIssueMappingByGithubWithRetry(issueNumber, repoMapping.id);
       if (!issueMapping) {
         console.warn(`GitHub #${issueNumber} 没有映射记录，跳过标签同步`);
         return { success: true, data: `GitHub #${issueNumber} 没有同步记录，跳过标签同步` };
@@ -1499,6 +1499,25 @@ export class SyncService {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * 按 GitHub issue 编号查映射；查不到时等几秒再查一次。
+   * 原因：GitHub 的 labeled / edited / closed / 评论 事件可能比镜像创建（约 2~3 秒）先到——
+   * 事件本身没问题，只是映射还没写进库，重试一次就能接上；不重试的话这次改动会永久丢掉
+   * （实测：建完 issue 立刻点标签，就会撞上这个窗口）。
+   */
+  private async getIssueMappingByGithubWithRetry(
+    githubIssueNumber: number,
+    repositoryId: number,
+    delayMs = 4000
+  ): Promise<IssueMapping | null> {
+    const first = await this.getIssueMappingByGithub(githubIssueNumber, repositoryId);
+    if (first) {
+      return first;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return await this.getIssueMappingByGithub(githubIssueNumber, repositoryId);
   }
 
   /**
