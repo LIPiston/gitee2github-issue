@@ -26,12 +26,14 @@
 	],
 
 	/**
-	 * 定时对齐：Gitee 不为「标签 / 标题 / 正文」的后续编辑投递 webhook（实测网页改、API 改都不发），
-	 * 所以每 30 分钟定时拉一段回来对齐（按时间轮转 offset，每次 10 条，幂等）。
+	 * 定时对齐（默认关闭）：Gitee 不为「标签 / 标题 / 正文」的后续编辑投递 webhook，
+	 * 打开下面的 crons 就会每 30 分钟拉一段回来对齐（按时间轮转 offset，每次 10 条，幂等）。
+	 * 需要时把这段取消注释并 `npx wrangler deploy` 即可；关闭状态下仍有「事件顺风车」对齐
+	 * 与 POST /api/backfill {"mode":"reconcile"} 两种手动方式。
 	 */
-	"triggers": {
-		"crons": ["*/30 * * * *"]
-	},
+	// "triggers": {
+	// 	"crons": ["*/30 * * * *"]
+	// },
 
 	"observability": {
 		"enabled": true

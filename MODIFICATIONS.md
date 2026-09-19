@@ -127,7 +127,7 @@ curl -X POST https://<域>/api/backfill \
 
 - `reconcileGiteeIssueToGithub()`：读 Gitee 的标题 / 正文 / 标签与 GitHub 的同样三项，只把有差异的字段写回 GitHub。正文比较前先剥掉尾部的来源标注；写回时保留 GitHub 侧**最早**的那条标注，避免归属被反复改写。
 - **顺带对齐**：每次收到 Gitee 的 issue 事件（建 issue / 评论 / 状态变化）处理完后，顺手对该 issue 跑一次上面的对齐。这样「改完标签再评论一句」就能把标签带过去。
-- **定时兜底**：`wrangler.jsonc` 增加 `triggers.crons = ["*/30 * * * *"]`，每 30 分钟按「时间轮转的 offset」拉一段（10 条/次）回来对齐。任何一条改动最多 30~90 分钟必然收敛，且不需要额外存状态（offset 由当前时间算出）。
+- **定时兜底（默认关闭，按用户要求已停用）**：`wrangler.jsonc` 里保留了一段**注释掉的** `triggers.crons = ["*/30 * * * *"]`，取消注释再 deploy 即启用；每 30 分钟按「时间轮转的 offset」拉一段（10 条/次），任何改动最多 30~90 分钟收敛，不需要额外存状态（offset 由当前时间算出）。停用前实测它正常触发过一轮（`@ 20:30:04 - Ok`，日志「处理 10 条，剩余 5 条，本轮改动 0 处」）。关闭状态下仍有另外两条途径：事件顺风车 + 手动接口。
 - **手动修**：`POST /api/backfill` 新增 `{"mode":"reconcile","limit":5,"offset":0}`（Bearer `ADMIN_PASSWORD`），用于立刻对齐或修复历史漂移；成对 issue 用若干个窗口跑一遍即可全覆盖（25 条 = 5 个窗口）。
 
 **镜像创建期的竞态（顺带修掉）**：用户「建完 issue 立刻点标签」时，GitHub 的 `labeled` 事件比镜像创建 + 写映射（约 2~3 秒）先到，事件因查不到映射被丢掉——而 GitHub→Gitee 方向没有拉取兜底，这个标签就永远同步不过去。现在 GitHub 侧的处理器（标签 / 编辑 / 状态 / 评论）查不到映射时**等 4 秒再查一次**。实测无映射的探针事件耗时 1.8s → 5.8s，返回仍是软跳过的 200。`opened` 那条（自己负责创建映射）不加这个重试。
@@ -203,6 +203,6 @@ curl -X POST https://<域>/api/backfill \
 | 标签 | Gitee → GitHub（后续变更） | IKH0MO 在网页加上 `bug` 后，GitHub #24 由 `[enhancement]` 变为 `[bug, enhancement]`；Gitee 全程未投递标签事件，靠 `mode:"reconcile"` 拉取完成 |
 | 顺带对齐 | 一次真实的重开事件 | 同一次 `state_change` 事件里，Gitee 侧新增的 `documentation` 标签（从未投递过事件）被一并拉到 GitHub #26 |
 | 幂等性 | `/api/backfill mode=reconcile` 跑两遍（25 条 × 5 窗口） | 第二遍全部 `in_sync`，包括此前反复被写的 4 条（正文标注堆叠问题已修） |
-| 定时兜底 | `triggers.crons` | 部署输出 `schedule: */30 * * * *` 已注册；对齐逻辑本身用 `/api/backfill mode=reconcile` 逐窗口验证通过 |
+| 定时兜底 | `triggers.crons` | 注册后实测触发一轮（`*/30 * * * * @ 20:30:04 - Ok`，日志「处理 10 条，剩余 5 条，本轮改动 0 处」）；随后按用户要求停用，配置改为注释掉，部署输出已无 schedule 行 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。
