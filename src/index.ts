@@ -221,14 +221,14 @@ export default {
    */
   async scheduled(controller, env, ctx): Promise<void> {
     const syncService = new SyncService(env);
-    const result = await syncService.cronReconcile(10);
+    const result = await syncService.cronReconcile(20);
     if (!result.success) {
       console.error('定时对齐失败:', result.error);
       return;
     }
     console.log(
       `定时对齐：处理 ${result.data?.processed ?? 0} 条，剩余 ${result.data?.remaining ?? 0} 条，` +
-        `本轮改动 ${result.data?.changed.length ?? 0} 处` +
+        `本轮改动 ${result.data?.changed.length ?? 0} 处，失败 ${result.data?.failed ?? 0} 条` +
         (result.data?.changed.length ? `：${result.data!.changed.join('；')}` : '')
     );
   },

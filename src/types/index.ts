@@ -77,6 +77,8 @@ export interface GiteeIssue {
     namespace: string;
     path: string;
   };
+  /** issue 详情里会带上已挂的标签（省一次子请求）；不是所有响应都带，所以可选 */
+  labels?: Array<{ id?: number; name: string; color?: string }>;
 }
 
 // Gitee Comment类型

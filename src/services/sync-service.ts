@@ -16,6 +16,12 @@ import { Env, Result, GiteeWebhookEvent, RepositoryMapping, IssueMapping } from 
 import { GiteeService } from './gitee-service';
 import { GitHubService } from './github-service';
 
+/**
+ * 定时对齐的周期，必须与 wrangler.jsonc 里 triggers.crons 的周期保持一致
+ * （当前：每 4 小时一次，`0 *​/4 * * *`）。轮转窗口按这个值推进，改成别的周期时要一起改。
+ */
+const CRON_PERIOD_MS = 4 * 60 * 60 * 1000;
+
 export class SyncService {
   private giteeService: GiteeService;
   private githubService: GitHubService;
@@ -591,19 +597,29 @@ export class SyncService {
       }
 
       // 标签：Gitee → GitHub（反方向由 labeled / unlabeled 事件驱动）
-      const giteeLabels = await this.giteeService.getIssueLabels(
-        repoMapping.gitee_owner,
-        repoMapping.gitee_repo,
-        giteeNumber
-      );
-      if (giteeLabels.success) {
-        const wanted = (giteeLabels.data || []).map((label) => label.name).sort();
+      // 优先用 issue 详情里自带的 labels：单次调用的子请求数有硬上限（免费版 50），
+      // 每省一次读取就能多扫几条 issue。只有详情没带这个字段时才单独去读。
+      let giteeLabels: Array<{ name: string; color?: string }> | null = null;
+      if (Array.isArray(giteeIssue.labels)) {
+        giteeLabels = giteeIssue.labels;
+      } else {
+        const labelsResult = await this.giteeService.getIssueLabels(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          giteeNumber
+        );
+        if (labelsResult.success) {
+          giteeLabels = labelsResult.data || [];
+        }
+      }
+      if (giteeLabels) {
+        const wanted = giteeLabels.map((label) => label.name).sort();
         const current = (githubIssue.labels || []).map((label) => label.name).sort();
         if (wanted.join('|') !== current.join('|')) {
           const ensureResult = await this.githubService.ensureRepoLabels(
             repoMapping.github_owner,
             repoMapping.github_repo,
-            (giteeLabels.data || []).map((label) => ({ name: label.name, color: label.color }))
+            giteeLabels.map((label) => ({ name: label.name, color: label.color }))
           );
           if (!ensureResult.success) {
             return { success: false, error: ensureResult.error };
@@ -717,11 +733,12 @@ export class SyncService {
 
   /**
    * 定时兜底对齐（Cloudflare Cron 触发）：Gitee 侧的标签/标题/正文改动没有 webhook 通知，只能定期拉一遍。
-   * 用「按时间轮转的 offset」分段处理，避免单次处理太多而撞上 Worker 的执行时长上限。
+   * 分班处理：单次调用的子请求数有硬上限（免费版 50），每对 issue 要吃 2~3 个子请求，
+   * 所以一次只扫 perRun 条，窗口按时间轮转（不需要额外存状态），下一班接着扫下一段。
    */
   async cronReconcile(
-    perRun = 10
-  ): Promise<Result<{ processed: number; remaining: number; changed: string[] }>> {
+    perRun = 20
+  ): Promise<Result<{ processed: number; remaining: number; changed: string[]; failed: number }>> {
     try {
       const allMappings = await this.getAllRepositoryMappings();
       if (allMappings.length === 0) {
@@ -734,12 +751,12 @@ export class SyncService {
         total += mappings.filter((mapping) => mapping.gitee_issue_number).length;
       }
       if (total === 0) {
-        return { success: true, data: { processed: 0, remaining: 0, changed: [] } };
+        return { success: true, data: { processed: 0, remaining: 0, changed: [], failed: 0 } };
       }
 
-      // 每 30 分钟换一段（与 wrangler.jsonc 的 cron 周期一致），不需要额外存状态
+      // 按时间轮转窗口（周期与 cron 一致），不需要额外存状态
       const slots = Math.max(Math.ceil(total / perRun), 1);
-      const slot = Math.floor(Date.now() / (30 * 60 * 1000)) % slots;
+      const slot = Math.floor(Date.now() / CRON_PERIOD_MS) % slots;
 
       const result = await this.backfillReconcileGiteeToGithub(undefined, false, perRun, slot * perRun);
       if (!result.success) {
@@ -747,14 +764,28 @@ export class SyncService {
       }
 
       const data = result.data!;
-      const changed = (data.results || [])
+      const results = data.results || [];
+      const changed = results
         .filter((item) => item.action === 'reconciled')
         .map(
           (item) =>
             `Gitee ${item.gitee_issue} → GitHub ${item.github_issue}（${(item.changed || []).join('、')}）`
         );
 
-      return { success: true, data: { processed: data.processed, remaining: data.remaining, changed } };
+      // 失败要显式报出来：最常见的是撞上单次调用的子请求上限（Too many subrequests），
+      // 那种情况下这一班的后半段等于白跑，得靠日志发现（否则只会看到“处理 N 条”）。
+      const failed = results.filter((item) => item.action === 'error');
+      if (failed.length > 0) {
+        console.error(
+          `定时对齐有 ${failed.length} 条失败：` +
+            failed.map((item) => `${item.gitee_issue}:${item.detail || '未知错误'}`).join('；')
+        );
+      }
+
+      return {
+        success: true,
+        data: { processed: data.processed, remaining: data.remaining, changed, failed: failed.length },
+      };
     } catch (error) {
       return { success: false, error: `定时对齐异常: ${error instanceof Error ? error.message : String(error)}` };
     }

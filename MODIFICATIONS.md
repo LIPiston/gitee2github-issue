@@ -127,7 +127,7 @@ curl -X POST https://<域>/api/backfill \
 
 - `reconcileGiteeIssueToGithub()`：读 Gitee 的标题 / 正文 / 标签与 GitHub 的同样三项，只把有差异的字段写回 GitHub。正文比较前先剥掉尾部的来源标注；写回时保留 GitHub 侧**最早**的那条标注，避免归属被反复改写。
 - **顺带对齐**：每次收到 Gitee 的 issue 事件（建 issue / 评论 / 状态变化）处理完后，顺手对该 issue 跑一次上面的对齐。这样「改完标签再评论一句」就能把标签带过去。
-- **定时兜底（默认关闭，按用户要求已停用）**：`wrangler.jsonc` 里保留了一段**注释掉的** `triggers.crons = ["*/30 * * * *"]`，取消注释再 deploy 即启用；每 30 分钟按「时间轮转的 offset」拉一段（10 条/次），任何改动最多 30~90 分钟收敛，不需要额外存状态（offset 由当前时间算出）。停用前实测它正常触发过一轮（`@ 20:30:04 - Ok`，日志「处理 10 条，剩余 5 条，本轮改动 0 处」）。关闭状态下仍有另外两条途径：事件顺风车 + 手动接口。
+- **定时兜底（每 4 小时一班）**：`wrangler.jsonc` 的 `triggers.crons = ["0 */4 * * *"]`，每班按「时间轮转的窗口」拉 20 条回来对齐（`CRON_PERIOD_MS` 必须与 cron 周期保持一致，改周期要一起改）。**为什么不能一次扫完**：单次调用的子请求数有硬上限（免费版 50），每对 issue 要吃 2~3 个子请求，实测 26 条一起跑会从第 17 条开始全部报 `Too many subrequests by single Worker invocation`；20 条一班实测 0 失败。成对 issue 现在 26 条 → 两班轮一圈，某条改动最迟 8 小时对齐、平均 4 小时。日志会打印「处理 N 条，剩余 M 条，本轮改动 X 处，失败 Y 条」，失败非 0 时还会把每条的原因打出来（撞上限就是这种表现）。
 - **手动修**：`POST /api/backfill` 新增 `{"mode":"reconcile","limit":5,"offset":0}`（Bearer `ADMIN_PASSWORD`），用于立刻对齐或修复历史漂移；成对 issue 用若干个窗口跑一遍即可全覆盖（25 条 = 5 个窗口）。
 
 **镜像创建期的竞态（顺带修掉）**：用户「建完 issue 立刻点标签」时，GitHub 的 `labeled` 事件比镜像创建 + 写映射（约 2~3 秒）先到，事件因查不到映射被丢掉——而 GitHub→Gitee 方向没有拉取兜底，这个标签就永远同步不过去。现在 GitHub 侧的处理器（标签 / 编辑 / 状态 / 评论）查不到映射时**等 4 秒再查一次**。实测无映射的探针事件耗时 1.8s → 5.8s，返回仍是软跳过的 200。`opened` 那条（自己负责创建映射）不加这个重试。
@@ -157,6 +157,9 @@ curl -X POST https://<域>/api/backfill \
 12. **Gitee 会为自己 API 创建的 issue 投递 open webhook（状态变化同样会投递）**：这是「白天正常、跑一夜冒出重复 issue」的真凶。两条建 issue 路径的守卫必须是**确定性**的（正文里的来源标注），不能只查映射表——映射写入与 webhook 到达之间的竞态窗口有 2~3 秒。
 13. **标签在两边的接口脾气完全不同**：Gitee 加标签要**裸数组** `["bug"]`、建仓库标签要 **form 编码**、不存在的标签名会被**静默丢弃**；GitHub 则相反——给 issue 带不存在的标签**直接 422**，必须先建标签（`ensureRepoLabels`）。另外 Gitee 建 issue 的 `labels` 表单字段是生效的，但**响应体里的 `labels` 可能是空的**，别据此判断成败。
 14. **想知道一条重复 issue 是谁建的、从哪来，看作者 + 正文尾部**：机器人建的 issue 作者是 bot、正文尾部带 `🤖 此Issue由机器人从X同步 | 原始链接: …`。这一眼就能区分「平台原生」和「本服务的产物」，也能顺着链接还原整条回环链路（`#22 → IKH0M5 → #23 → IKH0M7`）。
+
+18. **单次调用的子请求数是硬上限（免费版 50），它是批量回灌/批量对齐的真实天花板**：每对 issue 的比对要 2~3 个子请求（Gitee issue、GitHub issue、外加可能的标签读写），所以一次最多扫十几到二十条。实测：26 条一起跑，前 16 条正常、后面 10 条全部报 `Too many subrequests by single Worker invocation`（任务本身没错，只是预算用完了）——而且错误是**逐条返回**的，别看到 HTTP 200 就以为全绿。省预算的招：Gitee 的 issue 详情里**自带 `labels`**，别再单独调一次标签接口。批处理接口/定时任务都要按这个上限分班，并把失败条数显式打进日志。
+19. **管理员接口的 `limit` 不是越大越好**：默认 5、建议 ≤20；要覆盖全部成对 issue 就按 offset 分批跑（`limit=20&offset=0`、`offset=20`…）。
 
 15. **「API 改动不触发 webhook」这个结论是错的**：Gitee 用 API 改状态**会**投递（`state_change`，实测约 10 秒内到）。当初判「不触发」是因为测的 issue 已经处于目标状态——**状态没变，Gitee 就不发事件**。要分辨「没投递」和「投递了我没处理」，先确认操作真的改变了状态，再开 `wrangler tail` 看请求到没到（注意 tail 的日志条目**只带请求头、不带 body**，别指望从那里面读 action；未处理的 Gitee 事件会以 `unhandled:<hook>:<action>` 落库，这才是查 action 名的地方）。
 16. **`wrangler tail --format json` 的输出是美化过的、跨多行的**：按 `\n{` 切块会漏解析，改用 `json.JSONDecoder().raw_decode()` 逐个取对象。
@@ -203,6 +206,6 @@ curl -X POST https://<域>/api/backfill \
 | 标签 | Gitee → GitHub（后续变更） | IKH0MO 在网页加上 `bug` 后，GitHub #24 由 `[enhancement]` 变为 `[bug, enhancement]`；Gitee 全程未投递标签事件，靠 `mode:"reconcile"` 拉取完成 |
 | 顺带对齐 | 一次真实的重开事件 | 同一次 `state_change` 事件里，Gitee 侧新增的 `documentation` 标签（从未投递过事件）被一并拉到 GitHub #26 |
 | 幂等性 | `/api/backfill mode=reconcile` 跑两遍（25 条 × 5 窗口） | 第二遍全部 `in_sync`，包括此前反复被写的 4 条（正文标注堆叠问题已修） |
-| 定时兜底 | `triggers.crons` | 注册后实测触发一轮（`*/30 * * * * @ 20:30:04 - Ok`，日志「处理 10 条，剩余 5 条，本轮改动 0 处」）；随后按用户要求停用，配置改为注释掉，部署输出已无 schedule 行 |
+| 定时兜底 | `triggers.crons = 0 */4 * * *` | 部署输出 `schedule: 0 */4 * * *` 已注册；批量规模用管理员接口实测：`limit=20` 两班（offset 0/20）零失败，`limit=40`（一次扫 26 条）从第 17 条起全报 Too many subrequests → 据此定为每次 20 条 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。
