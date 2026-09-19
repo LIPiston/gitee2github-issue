@@ -178,12 +178,20 @@ export default {
           body = {};
         }
 
-        const result = await syncService.backfillGitHubIssuesToGitee(
-          typeof body.repository_id === 'number' ? body.repository_id : undefined,
-          body.dry_run === true,
-          typeof body.limit === 'number' ? body.limit : 4,
-          body.mode === 'labels' ? 'labels' : 'issues'
-        );
+        const result =
+          body.mode === 'reconcile'
+            ? await syncService.backfillReconcileGiteeToGithub(
+                typeof body.repository_id === 'number' ? body.repository_id : undefined,
+                body.dry_run === true,
+                typeof body.limit === 'number' ? body.limit : 5,
+                typeof body.offset === 'number' ? body.offset : 0
+              )
+            : await syncService.backfillGitHubIssuesToGitee(
+                typeof body.repository_id === 'number' ? body.repository_id : undefined,
+                body.dry_run === true,
+                typeof body.limit === 'number' ? body.limit : 4,
+                body.mode === 'labels' ? 'labels' : 'issues'
+              );
 
         return new Response(JSON.stringify(result), {
           headers: { 'Content-Type': 'application/json' },
@@ -205,5 +213,23 @@ export default {
         status: 500
       });
     }
+  },
+
+  /**
+   * 定时兜底：Gitee 不会为「标签 / 标题 / 正文」的后续编辑投递 webhook，
+   * 靠 cron 定期把 Gitee 侧内容拉回来对齐（周期与分段逻辑见 wrangler.jsonc 的 triggers.crons）。
+   */
+  async scheduled(controller, env, ctx): Promise<void> {
+    const syncService = new SyncService(env);
+    const result = await syncService.cronReconcile(10);
+    if (!result.success) {
+      console.error('定时对齐失败:', result.error);
+      return;
+    }
+    console.log(
+      `定时对齐：处理 ${result.data?.processed ?? 0} 条，剩余 ${result.data?.remaining ?? 0} 条，` +
+        `本轮改动 ${result.data?.changed.length ?? 0} 处` +
+        (result.data?.changed.length ? `：${result.data!.changed.join('；')}` : '')
+    );
   },
 } satisfies ExportedHandler<Env>;

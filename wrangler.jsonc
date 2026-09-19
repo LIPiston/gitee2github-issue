@@ -25,6 +25,14 @@
 		}
 	],
 
+	/**
+	 * 定时对齐：Gitee 不为「标签 / 标题 / 正文」的后续编辑投递 webhook（实测网页改、API 改都不发），
+	 * 所以每 30 分钟定时拉一段回来对齐（按时间轮转 offset，每次 10 条，幂等）。
+	 */
+	"triggers": {
+		"crons": ["*/30 * * * *"]
+	},
+
 	"observability": {
 		"enabled": true
 	},

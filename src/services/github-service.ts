@@ -379,6 +379,66 @@ export class GitHubService {
   }
 
   /**
+   * 读取单个 issue 的关键字段（标题 / 正文 / 标签 / 状态）
+   */
+  async getIssue(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+  ): Promise<Result<{ title: string; body: string; state: string; html_url: string; labels: Array<{ name: string; color?: string }> }>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const response = await octokit.issues.get({ owner, repo, issue_number: issueNumber });
+      return {
+        success: true,
+        data: {
+          title: response.data.title || '',
+          body: response.data.body || '',
+          state: response.data.state,
+          html_url: response.data.html_url,
+          labels: (response.data.labels || []).map((label: any) =>
+            typeof label === 'string'
+              ? { name: label as string }
+              : { name: label.name as string, color: label.color as string }
+          ),
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `读取GitHub Issue失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 更新 issue 的标题 / 正文（只传需要改的字段）
+   */
+  async updateIssue(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    patch: { title?: string; body?: string },
+  ): Promise<Result<boolean>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      await octokit.issues.update({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.body !== undefined ? { body: patch.body } : {}),
+      });
+      return { success: true, data: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: `更新GitHub Issue失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * 读取 GitHub Issue 当前状态（用于判断是否需要写回，避免两侧来回写形成回环）
    */
   async getIssueState(

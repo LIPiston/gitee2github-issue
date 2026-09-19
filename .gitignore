@@ -170,3 +170,14 @@ dist
 
 .dev.vars
 .wrangler/
+
+# 本地凭据脚本（含明文密钥，禁止提交）
+verify_app.py
+test404.py
+verify_roundtrip.mjs
+keycheck.mjs
+fix_key.mjs
+redeliver.mjs
+check_deliveries.mjs
+gh_edit_replay.py
+verify_app.mjs

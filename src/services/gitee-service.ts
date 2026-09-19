@@ -21,7 +21,8 @@ export class GiteeService {
    * 验证Gitee Webhook签名
    */
   async verifyWebhookSignature(request: Request): Promise<boolean> {
-    // Gitee使用简单的密码验证方式
+    // Gitee 用「密码」校验：真实 webhook 同时带 body.password 与 X-Gitee-Token 头，
+    // 但个别事件类型可能只带其中之一 —— 两者都接受，避免把合法事件挡在门外（校验失败是静默丢事件）。
     const secret = this.env.GITEE_WEBHOOK_SECRET;
     // 未配置密钥时必须拒绝：否则 data.password 与 undefined 比较会通过，端点等于全开
     if (!secret) {
@@ -29,26 +30,34 @@ export class GiteeService {
       return false;
     }
 
-    try {
-      const data = await request.json() as any;
-      const provided = data?.password;
+    // 常量时间比较，避免时序侧信道
+    const matches = (provided: unknown): boolean => {
       if (typeof provided !== 'string' || provided.length !== secret.length) {
-        console.error('Gitee Webhook 密码校验失败');
         return false;
       }
-      // 常量时间比较，避免时序侧信道
       let diff = 0;
       for (let i = 0; i < secret.length; i++) {
         diff |= provided.charCodeAt(i) ^ secret.charCodeAt(i);
       }
-      if (diff !== 0) {
-        console.error('Gitee Webhook 密码校验失败');
-      }
       return diff === 0;
+    };
+
+    const headerToken = request.headers.get('x-gitee-token');
+    if (matches(headerToken)) {
+      return true;
+    }
+
+    try {
+      const data = await request.clone().json() as any;
+      if (matches(data?.password)) {
+        return true;
+      }
     } catch (error) {
       console.error('解析 Gitee Webhook 请求体失败:', error);
-      return false;
     }
+
+    console.error('Gitee Webhook 密码校验失败（body.password 与 X-Gitee-Token 均不匹配）');
+    return false;
   }
 
   /**

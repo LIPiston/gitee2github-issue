@@ -60,7 +60,7 @@ Gitee 把「创建 / 更新 issue」的接口从 `/repos/{owner}/{repo}/issues[/
 
 排查这类问题的正解：`GET https://gitee.com/api/v5/swagger_doc` 就是 Gitee 官方的 Swagger JSON（约 336 KB，直接可读），查 `paths` 即可确认当前真实路径与参数，不要去猜。
 
-另外实测：**通过 API 修改 Gitee issue 状态不会触发 Gitee 的 webhook**（改了状态后 30 秒内没有任何投递）。所以 Gitee → GitHub 方向只对网页 / 人工操作生效，用 API 改 Gitee 状态不会回流到 GitHub。
+另外更正一条早前的错误结论：**通过 API 修改 Gitee issue 状态是会投递 webhook 的**——`PATCH … state=closed`（issue 原本是 open）后约 10 秒内就收到了 `issue_hooks` 事件，action 名为 `state_change`。当初判「API 改状态不触发」，是因为测的那个 issue **已处于目标状态**（状态没变化，Gitee 自然不发事件）。真正一律不投递的是**标签 / 标题 / 正文的改动**（见第 12 节）。
 
 ### 7. POST /api/backfill —— 历史 issue 回灌（新增）
 
@@ -88,15 +88,53 @@ curl -X POST https://<域>/api/backfill \
   3. **仓库里不存在的标签名会被静默丢弃**：加标签接口照样返回 201，但标签根本没加上（实测 `good first issue` 就是被吃掉的）。所以同步前必须先确保标签存在——本副本的 `ensureRepoLabels` 会按 GitHub 的名字与颜色自动建。
 - 标签名限制：2-20 个字符，只允许汉字/字母/数字/`.`/`_`/`-`/`/`/`\` 与全角符号。名字不合法的（例如 GitHub 上常见的 `type: bug`）会被跳过并写日志，不影响同一事件里的其它同步。
 - 两边标签集原本不同：GitHub 多出 accessibility / documentation / good first issue / help wanted，Gitee 多出 feature。当前策略是“缺失就按 GitHub 的名字与颜色在 Gitee 建一个”，因此补齐后 Gitee 侧标签集会向 GitHub 靠拢（实测已自动建出 accessibility、documentation）。
-- **Gitee → GitHub 方向的标签同步未实现**：Gitee 是否在标签变化时投递 webhook 尚未验证；而且它的 API 改动一律不触发 webhook（见第 6 节）。
+- **Gitee → GitHub 方向的标签**：Gitee **不为**标签变更投递 webhook（实测：网页改一次、API 改一次，`wrangler tail` 里都没有任何标签事件），只能靠「拉取式对齐」补——见第 12 节。
 
 ### 9. 标题 / 正文编辑同步（GitHub → Gitee，新增）
 
 - **触发**：GitHub 的 `issues.edited` 事件，只处理 `changes` 里带 `title` 或 `body` 的编辑（改里程碑、置顶等同样会发 `issues.edited`，那些不含这两个字段，直接跳过）。
 - **实现**：owner 级 `PATCH /repos/{owner}/issues/{number}`，表单字段 `repo` + 需要改的 `title`/`body`；改正文时会重新套用与创建时一致的来源标注（尾部 footer 不会被吃掉）。
 - **为什么补**：这条路径原来完全没处理，而且很容易被误判成「回灌/创建流程有 bug」。实测案例：GitHub #19 创建时标题只有模板前缀 `[Bug]:`（issue 模板预填），作者 6 分钟后补全了标题；GitHub 侧显示正常，Gitee 侧永远停在 `[Bug]:`。看 GitHub 的 issue 时间线能直接定位：`renamed '[Bug]:' -> '[Bug]:数据采集…' @15:24:14`，而 Gitee 镜像创建于 `15:18:27`（open 事件后 6 秒）——**同步当时的标题就是 `[Bug]:`，创建流程没有错，缺的是编辑同步**。
-- **回环风险**：无。用 API 改 Gitee 不触发它自己的 webhook（见第 6 节）。
-- **未实现**：Gitee → GitHub 方向的编辑同步。Gitee 是否在编辑时投递 webhook、action 与载荷结构都还没观测到，等抓到真实事件再补。
+- **回环风险**：无。Gitee 不为正文编辑投递事件，改完不会回流（见第 12 节）。
+- **Gitee → GitHub 方向**：Gitee **不为**标题 / 正文的编辑投递 webhook（2026-09-19 实测），所以那个方向只能靠「拉取式对齐」——见第 12 节。
+
+### 10. 回环重复建 issue 的根因与修法（重要）
+
+**现象**：跑了一夜之后，同一内容在两个平台各多出一条：
+`#20(人) → IKH0CE(镜像) → #21(机器人) → IKH0CF(镜像)`、`#22(人) → IKH0M5(镜像) → #23(机器人) → IKH0M7(镜像)`。
+
+**根因（实测）**：**Gitee 会为本服务用 API 建的 issue 也投递 `issue_hooks/open`**（注意：Gitee 的**创建**与**状态变化**都会投递事件，见第 6 节的更正）。于是：
+1. GitHub 新建 #22 → 本服务在 Gitee 建镜像 IKH0M5，并写映射；
+2. Gitee 为 IKH0M5 投递 open 事件 → 映射表查询/写入之间是竞态窗口（事件 2~3 秒内到达）→ 查不到映射 → 认为这是「Gitee 上的新 issue」→ 在 GitHub 建出 #23；
+3. 反向映射写入时该 Gitee issue 已有映射（写入冲突/静默失败）→ #23 的 opened 事件又查不到映射 → 再在 Gitee 建出 IKH0M7；
+4. 到 IKH0M7 才停下（它是全新 issue，映射写入成功）。
+
+**修法**：不再依赖「查映射」这一道非确定性判断，改用**正文来源标记**做确定性守卫——本服务建的镜像 issue 正文里必然带 `🤖 此Issue由机器人从X同步`，两条建 issue 路径都先检查这个标记，命中就跳过（评论路径本来就有这个守卫，issue 路径漏了）。另外补上按 Gitee issue 编号查映射作兜底，并把未处理的 Gitee 事件落库（`unhandled:<hook>:<action>`）方便观测真实载荷。
+
+**验证**：GitHub #25 → Gitee 只有 IKH1WO 一条，无机器人建的 GitHub issue；Gitee IKH1YM → GitHub #26 一条，无多余镜像。
+
+### 11. Gitee → GitHub 的标签（新增）
+
+- **创建时带上**：Gitee 建 issue 时把 Gitee 侧标签一并带到 GitHub。GitHub 对「给 issue 带上仓库里不存在的标签」是**直接报 422**，所以要先按同名同色在 GitHub 仓库里把标签建出来（`ensureRepoLabels`），再带着名字创建 issue。实测 `feature`（原本只存在于 Gitee，颜色 B5CC18）被自动建到 GitHub 且颜色一致。
+- **Gitee 的 labels 字段**：建 issue 接口接受 `labels`（表单字段，逗号分隔），但**响应体里的 `labels` 可能是空的**——别据此判断是否生效，以标签接口为准。
+- **未实现**：Gitee 侧「后续改标签」的事件同步。Gitee 是否在标签变更时投递 webhook、action 叫什么，目前还没有观测到；未处理的事件会以 `unhandled:<hook>:<action>` 落库，等抓到真实事件再补（在 Gitee 网页上改一次标签即可观测）。
+
+### 12. Gitee → GitHub 的标签 / 标题 / 正文：为什么只能「拉」，怎么拉（新增）
+
+**实测事实（2026-09-19，`wrangler tail` 观测）**：Gitee 只为建 issue、状态变化、评论投递 webhook。**标签、标题、正文的后续改动一律不投递**——在网页上改一次、用 API 改一次，tail 里都只有别的事件，没有任何标签/编辑事件到达。
+
+所以 Gitee → GitHub 方向的「标签变更 / 编辑同步」不可能事件驱动，只能**读回 Gitee 当前状态再对齐**。本副本因此加了三条互为补充的「拉取式对齐」（全是幂等的，两侧一致时一个字节都不写）：
+
+- `reconcileGiteeIssueToGithub()`：读 Gitee 的标题 / 正文 / 标签与 GitHub 的同样三项，只把有差异的字段写回 GitHub。正文比较前先剥掉尾部的来源标注；写回时保留 GitHub 侧**最早**的那条标注，避免归属被反复改写。
+- **顺带对齐**：每次收到 Gitee 的 issue 事件（建 issue / 评论 / 状态变化）处理完后，顺手对该 issue 跑一次上面的对齐。这样「改完标签再评论一句」就能把标签带过去。
+- **定时兜底**：`wrangler.jsonc` 增加 `triggers.crons = ["*/30 * * * *"]`，每 30 分钟按「时间轮转的 offset」拉一段（10 条/次）回来对齐。任何一条改动最多 30~90 分钟必然收敛，且不需要额外存状态（offset 由当前时间算出）。
+- **手动修**：`POST /api/backfill` 新增 `{"mode":"reconcile","limit":5,"offset":0}`（Bearer `ADMIN_PASSWORD`），用于立刻对齐或修复历史漂移；成对 issue 用若干个窗口跑一遍即可全覆盖（25 条 = 5 个窗口）。
+
+**顺带修掉的三个坑**：
+
+1. **状态事件的 action 叫 `state_change`**（不是 `close` / `reopen`）。原来的分支只认 close/reopen，所以**真实 Gitee 关闭/重开从来没有同步过**（早前「验证过」用的是自己回放的签名事件，回放时用的 action 恰好是 close）。现在 `state_change` 也走状态同步，且状态以「读回 Gitee 的当前状态」为准——这类事件只告诉你状态变了，不告诉你是变成 open 还是 closed。
+2. **正文来源标注会叠起来**：早先的「去尾」只剥掉最后一个标注，而历史正文里已经叠了 3 个（每同步一次多一段）→ 两侧内容永远不相等 → 每次对齐都再写一次、永不收敛。现在「去尾」循环剥掉**所有**尾部标注，写回时保留最早那条（内容的真实来源）。被写花的 4 条 issue 就此稳住（再跑两遍全部 `in_sync`）。
+3. **Webhook 密码校验只认 body 里的 `password`**：真实事件同时带 `X-Gitee-Token` 头，个别事件类型可能只带其中一种，只认 body 会把合法事件以 400 丢掉（而且日志里什么都不留）。现在两种凭据都接受，仍然做常量时间比较。
 
 ## 部署踩坑记录
 
@@ -112,8 +150,15 @@ curl -X POST https://<域>/api/backfill \
 7. **事件范围**（本副本已扩展）：issue 创建双向、评论双向、关闭/重开双向；标题与正文的后续编辑不同步；删除不同步（Gitee 端删除会留下映射，见第 3 节 404 诊断）。
 8. **Gitee 的权限不足同样伪装成 404**：令牌缺 `issues` 权限时，写 issue 返回的还是 404（配合第 6 节的路径问题，会让人误判两次）。快速自检：`GET /api/v5/user/repos` —— 没 `projects` 权限时它会直接说 `401 Unauthorized: no 'projects' scope`；`/user`（user_info）与评论接口（notes）不受影响，所以会出现“能发评论但不能建 issue”这种诡异组合。
 9. **写 Gitee 的接口用表单而不是 JSON**：把 JSON 发给 owner 级接口不会报参数错误，只会失败在别的地方（本次踩坑：路径错的时候 JSON/表单都是一样的 404，路径对了之后必须换成 `x-www-form-urlencoded`）。
-10. **API 改动不触发 Gitee webhook**：用 API 关掉 Gitee issue，GitHub 侧不会跟着变（实测 30 秒无投递）。验收 Gitee → GitHub 方向必须在**网页**上操作，或者回放 webhook。
+10. **Gitee 的事件投递规律（含一条更正）**：会投递的只有三类——建 issue（`issue_hooks/open`）、状态变化（`issue_hooks/state_change`，**API 触发的也算**）、评论（`note_hooks/comment`）；**标签 / 标题 / 正文的改动一律不投递**（网页改、API 改都不发）。所以 Gitee → GitHub 的标签与编辑只能靠「拉」（第 12 节），而状态同步是可以事件驱动的。另外「状态没变化」时 Gitee 不会发事件——重复关闭一个已关闭的 issue，等多久都不会有请求进来。
 11. **「同步过去的内容不一致」先查 GitHub 的 issue 时间线，别先怀疑回灌**：Gitee 镜像标题只剩 `[Bug]:` 那次，`GET /repos/{owner}/{repo}/issues/{n}/timeline` 直接给出答案——`labeled @15:18:22`、`renamed '[Bug]:' -> '[Bug]:数据采集…' @15:24:14`，而镜像创建于 `15:18:27`。结论是「同步那一刻的标题就是这样，之后 6 分钟的编辑没人同步」。排查这类问题要先对齐两侧时间线，再判断是漏同步还是时序问题，否则会在回灌流程里白翻半天。
+12. **Gitee 会为自己 API 创建的 issue 投递 open webhook（状态变化同样会投递）**：这是「白天正常、跑一夜冒出重复 issue」的真凶。两条建 issue 路径的守卫必须是**确定性**的（正文里的来源标注），不能只查映射表——映射写入与 webhook 到达之间的竞态窗口有 2~3 秒。
+13. **标签在两边的接口脾气完全不同**：Gitee 加标签要**裸数组** `["bug"]`、建仓库标签要 **form 编码**、不存在的标签名会被**静默丢弃**；GitHub 则相反——给 issue 带不存在的标签**直接 422**，必须先建标签（`ensureRepoLabels`）。另外 Gitee 建 issue 的 `labels` 表单字段是生效的，但**响应体里的 `labels` 可能是空的**，别据此判断成败。
+14. **想知道一条重复 issue 是谁建的、从哪来，看作者 + 正文尾部**：机器人建的 issue 作者是 bot、正文尾部带 `🤖 此Issue由机器人从X同步 | 原始链接: …`。这一眼就能区分「平台原生」和「本服务的产物」，也能顺着链接还原整条回环链路（`#22 → IKH0M5 → #23 → IKH0M7`）。
+
+15. **「API 改动不触发 webhook」这个结论是错的**：Gitee 用 API 改状态**会**投递（`state_change`，实测约 10 秒内到）。当初判「不触发」是因为测的 issue 已经处于目标状态——**状态没变，Gitee 就不发事件**。要分辨「没投递」和「投递了我没处理」，先确认操作真的改变了状态，再开 `wrangler tail` 看请求到没到（注意 tail 的日志条目**只带请求头、不带 body**，别指望从那里面读 action；未处理的 Gitee 事件会以 `unhandled:<hook>:<action>` 落库，这才是查 action 名的地方）。
+16. **`wrangler tail --format json` 的输出是美化过的、跨多行的**：按 `\n{` 切块会漏解析，改用 `json.JSONDecoder().raw_decode()` 逐个取对象。
+17. **改代码时别在正则里写 `\r`**：补丁工具会把 `\r?\n` 解析成真实回车，把正则拆成多行、直接编译不过（本次踩到，最后改成按行扫描的函数）。这类替换用脚本 + `newline=''` 读写更稳。
 
 ## 需要配置的 secrets
 
@@ -130,12 +175,13 @@ curl -X POST https://<域>/api/backfill \
 ## 已知待改进
 
 - Gitee → GitHub 方向的标题/正文编辑不同步（GitHub → Gitee 已实现，见第 9 节；反向需要先抓到 Gitee 的编辑事件）。
+- Gitee → GitHub 方向的「后续标签变更」不同步（创建时已带上，见第 11 节；变更事件同样要先观测 Gitee 的载荷）。
 - Gitee 端删除 issue 或修改标题后的映射状态不主动校验（映射表只在创建时写入）。
 - 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；上线前已在 GitHub 侧建好的 issue 用 `POST /api/backfill`（见第 7 节）补，并且接口本身也没有节流重试。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。
 
-## 线上验证记录（2026-09-18，Cloudflare Worker 实测）
+## 线上验证记录（2026-09-18 ~ 09-19，Cloudflare Worker 实测）
 
 | 方向 | 操作 | 判据 |
 | --- | --- | --- |
@@ -149,5 +195,12 @@ curl -X POST https://<域>/api/backfill \
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 | 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |
 | 编辑 | GitHub → Gitee | `issues.edited` 同步标题与正文：真实事件改 #17 正文后 Gitee IKGYR7 正文跟随（尾部来源标注保留）；#19 的标题用签名事件补齐，Gitee IKGYZA 由 `[Bug]:` 变为完整标题 |
+| 回环（重复建 issue） | 两个方向的真实事件 | GitHub #25（带 bug）→ Gitee 只出现一条镜像 IKH1WO，未再生成机器人建的 GitHub issue；Gitee 新建 IKH1YM（带 feature）→ GitHub 只有 #26 一条 |
+| 标签 | Gitee → GitHub | 建 issue 时把 Gitee 标签一起带上：`feature`（原本只在 Gitee）被自动建到 GitHub #26，颜色 B5CC18 与 Gitee 一致 |
+| 状态 | Gitee → GitHub（API 触发） | `PATCH … state=closed/open` 后约 10 秒收到 `issue_hooks/action=state_change`，GitHub #26 开关状态两次都跟随（修复前这条路径完全没被处理） |
+| 标签 | Gitee → GitHub（后续变更） | IKH0MO 在网页加上 `bug` 后，GitHub #24 由 `[enhancement]` 变为 `[bug, enhancement]`；Gitee 全程未投递标签事件，靠 `mode:"reconcile"` 拉取完成 |
+| 顺带对齐 | 一次真实的重开事件 | 同一次 `state_change` 事件里，Gitee 侧新增的 `documentation` 标签（从未投递过事件）被一并拉到 GitHub #26 |
+| 幂等性 | `/api/backfill mode=reconcile` 跑两遍（25 条 × 5 窗口） | 第二遍全部 `in_sync`，包括此前反复被写的 4 条（正文标注堆叠问题已修） |
+| 定时兜底 | `triggers.crons` | 部署输出 `schedule: */30 * * * *` 已注册；对齐逻辑本身用 `/api/backfill mode=reconcile` 逐窗口验证通过 |
 
 补充：Gitee 令牌必须同时具备 `projects`（列仓库）、`issues`（建/改 issue）、`notes`（评论）三个权限；只给 `notes` 时会表现为“评论能同步、建 issue 报 404”。

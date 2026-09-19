@@ -45,16 +45,36 @@ export class SyncService {
         return { success: true, data: '事件已处理过，跳过' };
       }
 
-      // 根据事件类型处理
+      // 根据事件类型处理。issue 类事件处理完后再补一次「拉取式对齐」：
+      // Gitee 不为标签 / 标题 / 正文的后续编辑投递任何 webhook（实测网页改、API 改都不发），
+      // 只能借每次事件的顺风车把两侧内容对齐（幂等，没差异时不写）。
+      let result: Result<string> | null = null;
       if (event.hook_name === 'issue_hooks' && event.action === 'open') {
         // 处理新建Issue事件
-        return await this.handleGiteeNewIssue(event, eventId);
+        result = await this.handleGiteeNewIssue(event, eventId);
       } else if ((event.hook_name === 'issue_hooks' || event.hook_name === 'note_hooks') && event.action === 'comment') {
         // 处理Issue评论事件
-        return await this.handleGiteeNewComment(event, eventId);
-      } else if (event.hook_name === 'issue_hooks' && ['close', 'closed', 'reopen', 'reopened'].includes(event.action)) {
-        // 处理Issue关闭/重开事件
-        return await this.handleGiteeIssueStateChange(event, eventId);
+        result = await this.handleGiteeNewComment(event, eventId);
+      } else if (
+        event.hook_name === 'issue_hooks' &&
+        ['close', 'closed', 'reopen', 'reopened', 'state_change'].includes(event.action)
+      ) {
+        // 处理Issue关闭/重开事件（Gitee 真实事件里的 action 叫 state_change）
+        result = await this.handleGiteeIssueStateChange(event, eventId);
+      } else if (event.hook_name === 'issue_hooks' && event.issue) {
+        // 其它 issue 事件（标签变更、标题/正文编辑、分配等）：Gitee 的 action 名不一定叫 label / edit，
+        // 所以不猜——读回 Gitee 侧当前内容，对齐到 GitHub，只写真正有差异的字段（幂等）。
+        return await this.handleGiteeIssueGeneric(event, eventId);
+      }
+
+      if (result && result.success && event.issue && event.repository?.full_name) {
+        const pulled = await this.pullAlignGiteeIssue(event.repository.full_name, event.issue);
+        if (pulled) {
+          result = { success: true, data: `${result.data}；顺带对齐：${pulled}` };
+        }
+      }
+      if (result) {
+        return result;
       }
 
       // 未处理的事件也落一条记录，方便观测 Gitee 到底会为哪些动作投递事件
@@ -213,7 +233,7 @@ export class SyncService {
 
       // 格式化Issue内容
       const formattedBody = this.giteeService.formatIssueBody(
-        issueBody,
+        this.stripSyncFooter(issueBody),
         issueUrl,
         authorName
       );
@@ -413,7 +433,16 @@ export class SyncService {
         return { success: true, data: `Gitee issue ${event.issue.id} 没有同步记录（非同步创建的 issue），跳过` };
       }
 
-      const state: 'open' | 'closed' = event.action.startsWith('reopen') ? 'open' : 'closed';
+      // 状态以「从 Gitee 读回的当前状态」为准：state_change 这类 action 并不说明变成了什么状态
+      let state: 'open' | 'closed' = event.action.startsWith('reopen') ? 'open' : 'closed';
+      const liveState = await this.giteeService.getIssueState(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        issueMapping.gitee_issue_number
+      );
+      if (liveState.success && liveState.data) {
+        state = liveState.data;
+      }
 
       // 目标端已经是该状态时直接跳过（这种情况通常就是上一步写回造成的事件回环）
       const currentState = await this.githubService.getIssueState(
@@ -445,6 +474,289 @@ export class SyncService {
       };
     } catch (error) {
       return { success: false, error: `处理Gitee Issue状态变更异常: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /**
+   * 判断某一行是不是同步来源标注
+   */
+  private isSyncFooterLine(line: string): boolean {
+    const text = (line || '').trim();
+    return text.startsWith('> 🤖 此') && text.includes('由机器人从');
+  }
+
+  /**
+   * 取出正文里「最早」的一条来源标注：堆叠多份时它才是内容的真实来源，写回时保留它。
+   */
+  private extractSyncFooter(body: string): string | null {
+    for (const line of (body || '').split('\n')) {
+      if (this.isSyncFooterLine(line)) {
+        return line.trim();
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 去掉正文尾部「所有」同步来源标注（历史正文里可能堆叠了多份），只留真实内容。
+   */
+  private stripSyncFooter(body: string): string {
+    const lines = (body || '').split('\n');
+    let end = lines.length;
+    while (end > 0) {
+      let i = end - 1;
+      while (i >= 0 && lines[i].trim() === '') {
+        i -= 1;
+      }
+      if (i < 0 || !this.isSyncFooterLine(lines[i])) {
+        break;
+      }
+      i -= 1; // 标注行本身
+      while (i >= 0 && (lines[i].trim() === '---' || lines[i].trim() === '')) {
+        i -= 1; // 标注行上面的分隔线与空行
+      }
+      end = i + 1;
+    }
+    return lines.slice(0, end).join('\n').trimEnd();
+  }
+
+  /**
+   * 把 Gitee 侧的 issue 内容对齐到 GitHub（标题 / 正文 / 标签）。
+   * 用于「Gitee 改了东西、但我们没收到（或不认识）对应事件」的场景：只写真正有差异的字段，重复调用幂等。
+   */
+  private async reconcileGiteeIssueToGithub(
+    repoMapping: RepositoryMapping,
+    issueMapping: IssueMapping
+  ): Promise<Result<string[]>> {
+    try {
+      const giteeNumber = issueMapping.gitee_issue_number;
+      if (!giteeNumber) {
+        return { success: false, error: '找不到对应的Gitee Issue编号' };
+      }
+
+      const giteeResult = await this.giteeService.getIssue(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        giteeNumber
+      );
+      if (!giteeResult.success) {
+        return { success: false, error: giteeResult.error };
+      }
+      const giteeIssue = giteeResult.data!;
+
+      const githubResult = await this.githubService.getIssue(
+        repoMapping.github_owner,
+        repoMapping.github_repo,
+        issueMapping.github_issue_number
+      );
+      if (!githubResult.success) {
+        return { success: false, error: githubResult.error };
+      }
+      const githubIssue = githubResult.data!;
+
+      const changed: string[] = [];
+      const patch: { title?: string; body?: string } = {};
+
+      if ((giteeIssue.title || '') !== (githubIssue.title || '')) {
+        patch.title = giteeIssue.title;
+        changed.push('标题');
+      }
+
+      const giteeContent = this.stripSyncFooter(giteeIssue.body || '');
+      const githubContent = this.stripSyncFooter(githubIssue.body || '');
+      if (giteeContent !== githubContent) {
+        // 保留 GitHub 侧已有的来源标注（别把归属改来改去），没有才按 Gitee 来源补一个
+          // 保留 GitHub 侧已有的来源标注（堆叠多份时取最早那条 = 真实来源），没有才按 Gitee 来源补一个
+        const existingFooter = this.extractSyncFooter(githubIssue.body || '');
+        patch.body = existingFooter
+          ? `${giteeContent}\n\n---\n${existingFooter}`
+          : this.githubService.formatIssueBody(
+              giteeContent,
+              giteeIssue.html_url,
+              giteeIssue.user?.login || 'unknown'
+            );
+        changed.push('正文');
+      }
+
+      if (Object.keys(patch).length > 0) {
+        const updateResult = await this.githubService.updateIssue(
+          repoMapping.github_owner,
+          repoMapping.github_repo,
+          issueMapping.github_issue_number,
+          patch
+        );
+        if (!updateResult.success) {
+          return { success: false, error: updateResult.error };
+        }
+      }
+
+      // 标签：Gitee → GitHub（反方向由 labeled / unlabeled 事件驱动）
+      const giteeLabels = await this.giteeService.getIssueLabels(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        giteeNumber
+      );
+      if (giteeLabels.success) {
+        const wanted = (giteeLabels.data || []).map((label) => label.name).sort();
+        const current = (githubIssue.labels || []).map((label) => label.name).sort();
+        if (wanted.join('|') !== current.join('|')) {
+          const ensureResult = await this.githubService.ensureRepoLabels(
+            repoMapping.github_owner,
+            repoMapping.github_repo,
+            (giteeLabels.data || []).map((label) => ({ name: label.name, color: label.color }))
+          );
+          if (!ensureResult.success) {
+            return { success: false, error: ensureResult.error };
+          }
+          const labelResult = await this.githubService.setIssueLabels(
+            repoMapping.github_owner,
+            repoMapping.github_repo,
+            issueMapping.github_issue_number,
+            ensureResult.data!
+          );
+          if (!labelResult.success) {
+            return { success: false, error: labelResult.error };
+          }
+          changed.push(`标签(${ensureResult.data!.join('、') || '清空'})`);
+        }
+      }
+
+      return { success: true, data: changed };
+    } catch (error) {
+      return {
+        success: false,
+        error: `对齐 Gitee → GitHub 异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 处理 Gitee 侧「其它」issue 事件（action 名不认识的那些）：
+   * 不猜 action 的语义，直接用「读回 Gitee 当前内容 → 对齐到 GitHub」兜底。
+   */
+  private async handleGiteeIssueGeneric(event: GiteeWebhookEvent, eventId: string): Promise<Result<string>> {
+    try {
+      if (!event.issue) {
+        return { success: false, error: 'Issue信息不存在' };
+      }
+
+      const [giteeOwner, giteeRepo] = event.repository.full_name.split('/');
+      const repoMapping = await this.getRepositoryMapping(giteeOwner, giteeRepo);
+      if (!repoMapping) {
+        return { success: false, error: `找不到仓库映射关系: ${giteeOwner}/${giteeRepo}` };
+      }
+
+      const issueMapping =
+        (await this.getIssueMapping(event.issue.id, repoMapping.id)) ||
+        (await this.getIssueMappingByGiteeNumber(String(event.issue.number), repoMapping.id));
+      if (!issueMapping || !issueMapping.gitee_issue_number) {
+        console.warn(`Gitee ${event.issue.number} 没有映射记录（action=${event.action}），跳过`);
+        return { success: true, data: `Gitee ${event.issue.number} 没有同步记录（非同步创建的 issue），跳过` };
+      }
+
+      const reconcileResult = await this.reconcileGiteeIssueToGithub(repoMapping, issueMapping);
+      if (!reconcileResult.success) {
+        return { success: false, error: reconcileResult.error };
+      }
+
+      await this.saveWebhookEvent(eventId, `issue_${event.action || 'update'}`, 'gitee');
+      const changed = reconcileResult.data || [];
+      return {
+        success: true,
+        data:
+          changed.length > 0
+            ? `已把 Gitee ${event.issue.number} 的改动对齐到 GitHub #${issueMapping.github_issue_number}（${changed.join('、')}）`
+            : `Gitee ${event.issue.number} 与 GitHub #${issueMapping.github_issue_number} 已一致，无需改动`,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `处理Gitee其它Issue事件异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 「拉取式」对齐：把 Gitee 侧当前的内容对齐到 GitHub。
+   * Gitee 不会为标签/标题/正文的后续编辑投递 webhook，所以借每次 Gitee 事件的机会补一次。
+   * 返回人类可读的说明；没有可做的事时返回 null。
+   */
+  private async pullAlignGiteeIssue(
+    repositoryFullName: string,
+    issue: { id: number; number: string }
+  ): Promise<string | null> {
+    try {
+      const [giteeOwner, giteeRepo] = repositoryFullName.split('/');
+      const repoMapping = await this.getRepositoryMapping(giteeOwner, giteeRepo);
+      if (!repoMapping) {
+        return null;
+      }
+
+      const issueMapping =
+        (await this.getIssueMapping(issue.id, repoMapping.id)) ||
+        (await this.getIssueMappingByGiteeNumber(issue.number, repoMapping.id));
+      if (!issueMapping || !issueMapping.gitee_issue_number) {
+        return null;
+      }
+
+      const reconcileResult = await this.reconcileGiteeIssueToGithub(repoMapping, issueMapping);
+      if (!reconcileResult.success) {
+        console.warn(`顺带对齐 Gitee ${issue.number} 失败: ${reconcileResult.error}`);
+        return null;
+      }
+
+      const changed = reconcileResult.data || [];
+      return changed.length > 0
+        ? `Gitee ${issue.number} 的${changed.join('、')}已对齐到 GitHub #${issueMapping.github_issue_number}`
+        : null;
+    } catch (error) {
+      console.warn(`顺带对齐异常: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * 定时兜底对齐（Cloudflare Cron 触发）：Gitee 侧的标签/标题/正文改动没有 webhook 通知，只能定期拉一遍。
+   * 用「按时间轮转的 offset」分段处理，避免单次处理太多而撞上 Worker 的执行时长上限。
+   */
+  async cronReconcile(
+    perRun = 10
+  ): Promise<Result<{ processed: number; remaining: number; changed: string[] }>> {
+    try {
+      const allMappings = await this.getAllRepositoryMappings();
+      if (allMappings.length === 0) {
+        return { success: false, error: '没有可用的仓库映射' };
+      }
+
+      let total = 0;
+      for (const repoMapping of allMappings) {
+        const mappings = await this.getAllIssueMappings(repoMapping.id);
+        total += mappings.filter((mapping) => mapping.gitee_issue_number).length;
+      }
+      if (total === 0) {
+        return { success: true, data: { processed: 0, remaining: 0, changed: [] } };
+      }
+
+      // 每 30 分钟换一段（与 wrangler.jsonc 的 cron 周期一致），不需要额外存状态
+      const slots = Math.max(Math.ceil(total / perRun), 1);
+      const slot = Math.floor(Date.now() / (30 * 60 * 1000)) % slots;
+
+      const result = await this.backfillReconcileGiteeToGithub(undefined, false, perRun, slot * perRun);
+      if (!result.success) {
+        return { success: false, error: result.error };
+      }
+
+      const data = result.data!;
+      const changed = (data.results || [])
+        .filter((item) => item.action === 'reconciled')
+        .map(
+          (item) =>
+            `Gitee ${item.gitee_issue} → GitHub ${item.github_issue}（${(item.changed || []).join('、')}）`
+        );
+
+      return { success: true, data: { processed: data.processed, remaining: data.remaining, changed } };
+    } catch (error) {
+      return { success: false, error: `定时对齐异常: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
@@ -484,7 +796,7 @@ export class SyncService {
 
       const authorName = event.issue.user?.login || 'unknown';
       const formattedBody = this.githubService.formatIssueBody(
-        event.issue.body || '',
+        this.stripSyncFooter(event.issue.body || ''),
         event.issue.html_url,
         authorName
       );
@@ -621,9 +933,10 @@ export class SyncService {
         patch.title = event.issue.title;
       }
       if (bodyChanged) {
-        // Gitee 侧的正文保持与创建时相同的格式（尾部带来源标注）
+        // Gitee 侧的正文保持与创建时相同的格式（尾部带来源标注）：
+        // 先把正文里历史遗留的标注剥掉再拼，否则会越叠越多（每同步一次多一段）
         patch.body = this.githubService.formatIssueBody(
-          event.issue.body || '',
+          this.stripSyncFooter(event.issue.body || ''),
           event.issue.html_url,
           event.issue.user?.login || 'unknown'
         );
@@ -775,6 +1088,90 @@ export class SyncService {
   }
 
   /**
+   * 反向对齐：按映射逐条把 Gitee 侧的内容（标题 / 正文 / 标签）对齐到 GitHub。
+   * 用于修复历史漂移，或 Gitee 那边改了东西、我们没收到（或不认识）事件的情况。幂等：内容一致时不写。
+   */
+  async backfillReconcileGiteeToGithub(
+    repositoryId?: number,
+    dryRun = false,
+    limit = 5,
+    offset = 0
+  ): Promise<Result<{ processed: number; remaining: number; results: any[] }>> {
+    try {
+      const allMappings = await this.getAllRepositoryMappings();
+      const repoMappings = repositoryId
+        ? allMappings.filter((m) => m.id === repositoryId)
+        : allMappings;
+
+      if (repoMappings.length === 0) {
+        return { success: false, error: '没有可用的仓库映射' };
+      }
+
+      const pairs: Array<{ repoMapping: RepositoryMapping; mapping: IssueMapping }> = [];
+      for (const repoMapping of repoMappings) {
+        const mappings = await this.getAllIssueMappings(repoMapping.id);
+        for (const mapping of mappings) {
+          if (mapping.gitee_issue_number) {
+            pairs.push({ repoMapping, mapping });
+          }
+        }
+      }
+
+      // 已对齐的成对 issue 不会因为「跑过一次」而从队列里消失（每次调用都要重新读回两侧内容才能判断），
+      // 所以用 offset 分段推进：offset 到哪就从哪继续，配合 limit 一次处理一小段。
+      const batch = pairs.slice(offset, offset + limit);
+      const results: any[] = [];
+
+      if (dryRun) {
+        for (const { mapping } of batch) {
+          results.push({
+            github_issue: `#${mapping.github_issue_number}`,
+            gitee_issue: mapping.gitee_issue_number,
+            action: 'would_reconcile',
+          });
+        }
+        return {
+          success: true,
+          data: { processed: 0, remaining: Math.max(pairs.length - offset, 0), results },
+        };
+      }
+
+      let processed = 0;
+      for (const { repoMapping, mapping } of batch) {
+        const reconcileResult = await this.reconcileGiteeIssueToGithub(repoMapping, mapping);
+        processed += 1;
+        results.push({
+          github_issue: `#${mapping.github_issue_number}`,
+          gitee_issue: mapping.gitee_issue_number,
+          action: reconcileResult.success
+            ? (reconcileResult.data || []).length > 0
+              ? 'reconciled'
+              : 'in_sync'
+            : 'error',
+          changed: reconcileResult.data || [],
+          detail: reconcileResult.success ? undefined : reconcileResult.error,
+        });
+        // 轻微节流，避免触发 GitHub 的二级限速
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      }
+
+      return {
+        success: true,
+        data: {
+          processed,
+          remaining: Math.max(pairs.length - offset - processed, 0),
+          results,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `反向对齐异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * 一次性回灌：把 GitHub 侧还没有映射记录的 issue 补建到 Gitee。
    * 同步是事件驱动的，功能上线前就已经存在的 GitHub issue 不会被追溯，用这个接口补齐。
    * 关键顺序：建完 issue 立刻写 issue_mappings —— Gitee 会马上回传 open 事件，
@@ -894,7 +1291,7 @@ export class SyncService {
         }
 
         const formattedBody = this.githubService.formatIssueBody(
-          issue.body,
+          this.stripSyncFooter(issue.body || ''),
           issue.html_url,
           issue.author
         );
@@ -1085,6 +1482,22 @@ export class SyncService {
       return result || null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * 读取某个仓库下的全部 issue 映射
+   */
+  private async getAllIssueMappings(repositoryId: number): Promise<IssueMapping[]> {
+    try {
+      const result = await this.env.DB.prepare(
+        `SELECT * FROM issue_mappings WHERE repository_id = ?`
+      )
+        .bind(repositoryId)
+        .all<IssueMapping>();
+      return result.results || [];
+    } catch {
+      return [];
     }
   }
 
