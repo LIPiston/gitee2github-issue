@@ -3,6 +3,8 @@
  * 改动：1) verifyWebhookSignature 由直接 return true 改为真正的 HMAC-SHA256 校验；
  *      2) 安装令牌改为按目标仓库动态解析（GET /repos/{owner}/{repo}/installation），
  *         不再依赖固定的 GITHUB_INSTALLATION_ID。
+ *      3) 新增标签支持：createIssue 可带标签；补齐仓库标签（缺失的按同名同色新建）、
+ *         读写 issue 标签（Gitee → GitHub 方向的标签同步用）。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Octokit } from '@octokit/rest';
@@ -172,6 +174,7 @@ export class GitHubService {
     repo: string,
     title: string,
     body: string,
+    labels?: string[],
   ): Promise<Result<{ number: number; html_url: string }>> {
     try {
       const octokit = await this.octokitFor(owner, repo);
@@ -180,6 +183,7 @@ export class GitHubService {
         repo,
         title,
         body,
+        ...(labels && labels.length > 0 ? { labels } : {}),
       });
 
       return {
@@ -193,6 +197,183 @@ export class GitHubService {
       return {
         success: false,
         error: `创建GitHub Issue失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 读取仓库标签（名称 + 颜色）
+   */
+  async listRepoLabels(
+    owner: string,
+    repo: string,
+  ): Promise<Result<Array<{ name: string; color?: string }>>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const response = await octokit.issues.listLabelsForRepo({ owner, repo, per_page: 100 });
+      return {
+        success: true,
+        data: response.data.map((label: any) => ({ name: label.name, color: label.color })),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `读取GitHub仓库标签失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 创建仓库标签
+   */
+  async createRepoLabel(
+    owner: string,
+    repo: string,
+    name: string,
+    color?: string,
+  ): Promise<Result<boolean>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      await octokit.issues.createLabel({
+        owner,
+        repo,
+        name,
+        color: (color || 'ededed').replace('#', ''),
+      });
+      return { success: true, data: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: `创建GitHub仓库标签失败(${name}): ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 确保这些标签在仓库里存在（缺失的按同名同色新建），返回可安全写入 issue 的标签名。
+   * GitHub 对「给 issue 带上不存在的标签」是直接报错（422），所以必须先补齐。
+   */
+  async ensureRepoLabels(
+    owner: string,
+    repo: string,
+    wanted: Array<{ name: string; color?: string }>,
+  ): Promise<Result<string[]>> {
+    try {
+      const existingResult = await this.listRepoLabels(owner, repo);
+      if (!existingResult.success) {
+        return { success: false, error: existingResult.error };
+      }
+
+      const existing = new Set(existingResult.data!.map((label) => label.name));
+      const applied: string[] = [];
+
+      for (const label of wanted) {
+        if (!label || typeof label.name !== 'string' || label.name.trim().length === 0) {
+          continue;
+        }
+        const name = label.name.trim();
+        if (name.length > 50) {
+          console.warn(`跳过名字过长的标签（GitHub 上限 50 字符）: ${name}`);
+          continue;
+        }
+        if (existing.has(name)) {
+          applied.push(name);
+          continue;
+        }
+        const createResult = await this.createRepoLabel(owner, repo, name, label.color);
+        if (createResult.success) {
+          existing.add(name);
+          applied.push(name);
+        } else {
+          console.warn(`跳过无法在 GitHub 创建的标签: ${name} —— ${createResult.error}`);
+        }
+      }
+
+      return { success: true, data: applied };
+    } catch (error) {
+      return {
+        success: false,
+        error: `准备GitHub标签异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 读取某个 issue 上的标签
+   */
+  async getIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+  ): Promise<Result<Array<{ name: string; color?: string }>>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      const response = await octokit.issues.listLabelsOnIssue({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100,
+      });
+      return {
+        success: true,
+        data: response.data.map((label: any) => ({ name: label.name, color: label.color })),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `读取GitHub Issue标签失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 整体替换某个 issue 的标签（传空数组等于清空）
+   */
+  async setIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    names: string[],
+  ): Promise<Result<boolean>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      await octokit.issues.setLabels({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        labels: names,
+      });
+      return { success: true, data: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: `设置GitHub Issue标签失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * 给某个 issue 追加标签
+   */
+  async addIssueLabels(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    names: string[],
+  ): Promise<Result<boolean>> {
+    try {
+      const octokit = await this.octokitFor(owner, repo);
+      await octokit.issues.addLabels({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        labels: names,
+      });
+      return { success: true, data: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: `添加GitHub Issue标签失败: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
   }

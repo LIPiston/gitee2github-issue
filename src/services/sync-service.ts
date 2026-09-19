@@ -5,7 +5,11 @@
  *      3) 建 issue 前查映射防止重复创建；无映射的事件软跳过（2xx）而非报 400；
  *      4) 标签同步（GitHub → Gitee）：创建时复制、labeled/unlabeled 事件、回灌补齐；
  *      5) 新增回灌方法（把 GitHub 侧历史 issue 补建到 Gitee，或只补齐标签）；
- *      6) 处理 issues.edited：把标题/正文的后续编辑同步到 Gitee（只认 changes 里带 title/body 的编辑）。
+ *      6) 处理 issues.edited：把标题/正文的后续编辑同步到 Gitee（只认 changes 里带 title/body 的编辑）；
+ *      7) 两个方向的建 issue 都加「正文来源标记 + 映射（id / 编号）」双重挡回环：Gitee 会为
+ *         本服务用 API 建的 issue 投递 open webhook，只查映射表存在竞态，会造成来回重复建 issue；
+ *      8) Gitee → GitHub 建 issue 时把 Gitee 侧标签一并带过去（缺失标签按同名同色在 GitHub 建出）；
+ *      9) 未处理的 Gitee 事件也落库（event_type 记成 unhandled:<hook>:<action>），便于观测真实载荷。
  * 详见本仓库根目录 MODIFICATIONS.md。
  */
 import { Env, Result, GiteeWebhookEvent, RepositoryMapping, IssueMapping } from '../types';
@@ -53,6 +57,14 @@ export class SyncService {
         return await this.handleGiteeIssueStateChange(event, eventId);
       }
 
+      // 未处理的事件也落一条记录，方便观测 Gitee 到底会为哪些动作投递事件
+      // （例如「标签变更」：在网页上试一次，再查 webhook_events 表就知道 action 叫什么）
+      await this.saveWebhookEvent(
+        eventId,
+        `unhandled:${event.hook_name || '?'}:${event.action || '?'}`,
+        'gitee'
+      );
+      console.warn(`未处理的 Gitee 事件: hook_name=${event.hook_name} action=${event.action}`);
       return { success: true, data: `不支持的事件类型: ${event.hook_name} ${event.action}` };
     } catch (error) {
       return { success: false, error: `处理Gitee Webhook异常: ${error instanceof Error ? error.message : String(error)}` };
@@ -105,6 +117,44 @@ export class SyncService {
   }
 
   /**
+   * 读取 Gitee issue 的标签，并确保它们在 GitHub 仓库里存在（缺失的按同名同色新建）。
+   * 返回可以安全写入 GitHub issue 的标签名数组。
+   */
+  private async resolveGithubLabelsForGiteeIssue(
+    repoMapping: RepositoryMapping,
+    giteeIssueNumber: string
+  ): Promise<string[]> {
+    try {
+      const labelsResult = await this.giteeService.getIssueLabels(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        giteeIssueNumber
+      );
+      if (!labelsResult.success) {
+        console.warn(`读取 Gitee ${giteeIssueNumber} 标签失败（不影响 issue 创建）: ${labelsResult.error}`);
+        return [];
+      }
+      if (!labelsResult.data || labelsResult.data.length === 0) {
+        return [];
+      }
+
+      const ensureResult = await this.githubService.ensureRepoLabels(
+        repoMapping.github_owner,
+        repoMapping.github_repo,
+        labelsResult.data.map((label) => ({ name: label.name, color: label.color }))
+      );
+      if (!ensureResult.success) {
+        console.warn(`准备 GitHub 标签失败（不影响 issue 创建）: ${ensureResult.error}`);
+        return [];
+      }
+      return ensureResult.data!;
+    } catch (error) {
+      console.warn(`准备 GitHub 标签异常: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    }
+  }
+
+  /**
    * 处理Gitee新建Issue事件
    */
   private async handleGiteeNewIssue(event: GiteeWebhookEvent, eventId: string): Promise<Result<string>> {
@@ -136,6 +186,26 @@ export class SyncService {
         };
       }
 
+      // 关键：Gitee 对我们用 API 建的 issue 也会投递 open webhook（实测会），
+      // 那类镜像 issue 的正文带「从GitHub同步」标记。只靠映射表会有竞态（映射刚写入、webhook 已到达），
+      // 所以用正文标记做确定性判断，直接跳过，否则两个平台会来回建 issue。
+      if ((event.issue.body || '').includes('🤖 此Issue由机器人从GitHub同步')) {
+        console.warn(`Gitee ${issueNumber} 正文带 GitHub 同步标记，是本服务建的镜像 issue，跳过`);
+        return {
+          success: true,
+          data: `Gitee ${issueNumber} 是机器人从 GitHub 同步过来的镜像，跳过`,
+        };
+      }
+
+      // 再兜一层：按 issue 编号查映射（万一 id 字段与映射表里存的不一致也能挡住）
+      const existingByNumber = await this.getIssueMappingByGiteeNumber(issueNumber, repoMapping.id);
+      if (existingByNumber) {
+        return {
+          success: true,
+          data: `该 Issue 已有映射（GitHub #${existingByNumber.github_issue_number}），跳过`,
+        };
+      }
+
       const issueTitle = event.issue.title;
       const issueBody = event.issue.body;
       const issueUrl = event.issue.html_url;
@@ -148,12 +218,17 @@ export class SyncService {
         authorName
       );
 
+      // 把 Gitee 侧的标签一起带过去：GitHub 对「给 issue 带上不存在的标签」是直接报 422，
+      // 所以先按同名同色把缺失的标签在 GitHub 仓库里建出来，再带着名字创建 issue。
+      const labelNames = await this.resolveGithubLabelsForGiteeIssue(repoMapping, issueNumber);
+
       // 在GitHub上创建对应的Issue
       const createResult = await this.githubService.createIssue(
         repoMapping.github_owner,
         repoMapping.github_repo,
         issueTitle,
-        formattedBody
+        formattedBody,
+        labelNames
       );
 
       if (!createResult.success) {
@@ -173,7 +248,12 @@ export class SyncService {
       // 记录已处理的事件
       await this.saveWebhookEvent(eventId, 'issue_open', 'gitee');
 
-      return { success: true, data: `成功同步Issue到GitHub: ${createResult.data!.html_url}` };
+      return {
+        success: true,
+        data:
+          `成功同步Issue到GitHub: ${createResult.data!.html_url}` +
+          (labelNames.length > 0 ? `（标签: ${labelNames.join(', ')}）` : ''),
+      };
     } catch (error) {
       return { success: false, error: `处理Gitee新建Issue异常: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -389,6 +469,16 @@ export class SyncService {
         return {
           success: true,
           data: `该 Issue 已由 Gitee 同步而来（Gitee ${existingMapping.gitee_issue_number}），跳过`,
+        };
+      }
+
+      // 反向同理：本服务建到 GitHub 的镜像 issue（正文带「从Gitee同步」标记）也会触发 opened 事件，
+      // App 建的 issue 再走一遍就会在 Gitee 多建一条，用正文标记确定性挡住。
+      if ((event.issue.body || '').includes('🤖 此Issue由机器人从Gitee同步')) {
+        console.warn(`GitHub #${event.issue.number} 正文带 Gitee 同步标记，是本服务建的镜像 issue，跳过`);
+        return {
+          success: true,
+          data: `GitHub #${event.issue.number} 是机器人从 Gitee 同步过来的镜像，跳过`,
         };
       }
 
@@ -975,6 +1065,22 @@ export class SyncService {
         `SELECT * FROM issue_mappings WHERE gitee_issue_id = ? AND repository_id = ?`
       )
         .bind(giteeIssueId, repositoryId)
+        .first<IssueMapping>();
+      return result || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 根据Gitee Issue编号获取Issue映射（编号形如 IKH0M5；与 gitee_issue_id 互为兜底）
+   */
+  private async getIssueMappingByGiteeNumber(giteeIssueNumber: string, repositoryId: number): Promise<IssueMapping | null> {
+    try {
+      const result = await this.env.DB.prepare(
+        `SELECT * FROM issue_mappings WHERE gitee_issue_number = ? AND repository_id = ?`
+      )
+        .bind(giteeIssueNumber, repositoryId)
         .first<IssueMapping>();
       return result || null;
     } catch {
