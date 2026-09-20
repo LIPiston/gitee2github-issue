@@ -95,8 +95,23 @@ export class GiteeService {
    * 404 {"message":"project or enterprise"}（Gitee 2026 起改成 owner 级路径）
    * 需要令牌具备 issues 权限
    */
-  async createIssue(owner: string, repo: string, title: string, body: string): Promise<Result<GiteeIssue>> {
+  async createIssue(
+    owner: string,
+    repo: string,
+    title: string,
+    body: string,
+    labels?: string[]
+  ): Promise<Result<GiteeIssue>> {
     try {
+      const form: Record<string, string> = { repo, title, body };
+      // 标签要在创建时一起带上（表单字段 labels 是逗号分隔的字符串）。
+      // 分两步（先建 issue 再挂标签）会留下一个「镜像暂时没有标签」的窗口，
+      // 而 Gitee 会为我们的创建动作投递 open 事件、顺风车对齐会把那个空标签当成源端，
+      // 反过来抹掉 GitHub 上的标签（#29 踩过）。
+      const usableLabels = (labels || []).filter((name) => typeof name === 'string' && name.length > 0);
+      if (usableLabels.length > 0) {
+        form.labels = usableLabels.join(',');
+      }
       const response = await fetch(
         `https://gitee.com/api/v5/repos/${owner}/issues`,
         {
@@ -106,7 +121,7 @@ export class GiteeService {
             'Content-Type': 'application/x-www-form-urlencoded',
             'Accept': 'application/json',
           },
-          body: new URLSearchParams({ repo, title, body }).toString(),
+          body: new URLSearchParams(form).toString(),
         }
       );
 
@@ -254,7 +269,21 @@ export class GiteeService {
   }
 
   /**
-   * 读取某个 Issue 上的标签
+   * Gitee 的标签名规则（API 原话：只允许汉字、字母、数字、小数点(.)、下划线(_)、中划线(-)、
+   * 正斜杠(/)、反斜杠(\) 以及全角符号，长度 2~20）。
+   * 用途：GitHub 上常见的 `help wanted` / `good first issue`（含空格）与 `type: bug`（含冒号）
+   * 在 Gitee 根本没有对应的标签，这类标签只存在于 GitHub 侧——对齐时不能把它当成
+   * 「Gitee 没有所以要删掉」，否则每轮对齐都会把 GitHub 独有的这些标签抹一遍。
+   */
+  static isLabelNameValid(name: string): boolean {
+    if (name.length < 2 || name.length > 20) {
+      return false;
+    }
+    return /^[A-Za-z0-9_.\-\/\\\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef]+$/.test(name);
+  }
+
+  /**
+   * 读取 Gitee issue 的标签
    */
   async getIssueLabels(
     owner: string,
@@ -449,6 +478,11 @@ export class GiteeService {
       for (const label of wanted) {
         if (existing.has(label.name)) {
           applied.push(label.name);
+          continue;
+        }
+        if (!GiteeService.isLabelNameValid(label.name)) {
+          // 提前按规则挡掉，省一次注定 400 的请求（典型：`help wanted` 带空格）
+          console.warn(`Gitee 标签名规则不允许，跳过（该标签只在 GitHub 侧存在）: ${label.name}`);
           continue;
         }
         const createResult = await this.createRepoLabel(owner, repo, label.name, label.color);

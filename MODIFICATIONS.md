@@ -166,6 +166,13 @@ curl -X POST https://<域>/api/backfill \
    想一次扫完就得压每对开销，两条经验：① Gitee 的 issue 详情里**自带 `labels`**，别再单独调一次标签接口；② 把「上次看到的源端 `updated_at`」存进映射表，源端没变就只读一次详情直接返回（每对 1 个子请求，26 条 35 秒跑完）。只做 ① 只能撑到 20 条左右，做 ② 才能随便扩。
 19. **「跳过未变动」必须有强制复检兜底**：靠 `updated_at` 跳过的前提是「源端没变 = 两边一致」，但事件同步偶发失败时源端确实没变、目标端却已经漂了——光跳过就永远修不回来。存一个「上次完整比对时间」，超过 7 天强制完整比对一次。
 
+20. **镜像创建不能「先建 issue、再挂标签」——那会把自己的标签抹掉（#29 现场）**：`handleGitHubNewIssue` 原来是「建 Gitee issue → 写映射 → 再单独同步标签」三步。而 Gitee 会为**我们自己创建的这个 issue** 投递 `issue_hooks/open`（第 12 条），那个事件的处理器找到映射后会顺手跑一次「拉取式对齐」——**当时镜像还没有标签**，对齐就把 Gitee 当权威源，把 GitHub 上的 `bug` 覆盖成空集。时间线（UTC）：`09:05:53` 用户建 #29 且模板给了 `bug` → `09:06:01` 我们建 Gitee 镜像 → `09:06:05` bot 摘掉 #29 的 `bug` → `09:06:06` 同一次调用写下 `verified_at`（= 刚做完一轮完整比对）→ `09:06:13` 延迟到达的 `labeled` 事件才把 `bug` 补到 Gitee。
+    修法两条缺一不可：① 先在 Gitee 仓库准备好同名同色标签，**创建时就带上**（`createIssue(..., labels)`，表单字段 `labels` 是逗号分隔字符串）；② `open` 事件不再触发「顺风车对齐」——镜像刚创建时 Gitee 才是源头，没有任何东西可拉，而那一刻它必然是不完整的。
+    **触发条件很常见**：任何人用带标签的模板在 GitHub 建 issue 都会撞上；即使没有 `open` 事件，下一个定时对齐同样会把标签抹掉，所以第 ② 条只是把窗口关小，真正的修复是标签必须在创建那一刻就在。
+21. **Gitee 标签名规则（API 原话）**：只允许汉字、字母、数字、小数点(.)、下划线(_)、中划线(-)、正斜杠(/)、反斜杠(\) 以及全角符号，长度 2~20。因此 GitHub 的默认标签里 **`help wanted`、`good first issue`（含空格）在 Gitee 根本建不出来**（不是"没同步"，是 400 `Name只允许…`），`type: bug`（含冒号）同理。推论：**这类标签只可能存在于 GitHub 侧，Gitee → GitHub 的对齐必须把它们排除在「要删的差异」之外**，否则每轮对齐都会把 GitHub 独有的它们抹一遍（修法：`GiteeService.isLabelNameValid()` 判为不可表示的名字保留在最终标签集合里；`ensureRepoLabels` 也据此提前跳过，省一次注定 400 的请求）。
+22. **「等映射」要轮询，不能只等一次**：镜像创建实测要 6~7 秒（建 issue → 准备标签 → 挂标签 → 写映射），而 GitHub 的 `labeled` / `issues.edited` 事件可能在这期间的任意时刻到达。原来只等一次 4000ms（#27 那次够用），#31 这次就不够了（日志：`GitHub #31 没有映射记录，跳过标签同步`）。改成轮询 `5 × 2500ms`，查到就走、最多 10 秒。
+23. **伪造的 `GitHub-Hookshot` UA 只对我们自己的 Worker 生效**：POST 到 `gitee.lipiston.eu.org` 时必须带它（否则被 Cloudflare 的 bot 规则 403、body 为空，看着像签名校验失败）；但拿它去调**真的** `api.github.com` 会被 GitHub 直接 403 并返回 HTML 页（看着像网络/代理问题）。调 GitHub API 用默认 UA 就好。
+
 15. **「API 改动不触发 webhook」这个结论是错的**：Gitee 用 API 改状态**会**投递（`state_change`，实测约 10 秒内到）。当初判「不触发」是因为测的 issue 已经处于目标状态——**状态没变，Gitee 就不发事件**。要分辨「没投递」和「投递了我没处理」，先确认操作真的改变了状态，再开 `wrangler tail` 看请求到没到（注意 tail 的日志条目**只带请求头、不带 body**，别指望从那里面读 action；未处理的 Gitee 事件会以 `unhandled:<hook>:<action>` 落库，这才是查 action 名的地方）。
 16. **`wrangler tail --format json` 的输出是美化过的、跨多行的**：按 `\n{` 切块会漏解析，改用 `json.JSONDecoder().raw_decode()` 逐个取对象。
 17. **改代码时别在正则里写 `\r`**：补丁工具会把 `\r?\n` 解析成真实回车，把正则拆成多行、直接编译不过（本次踩到，最后改成按行扫描的函数）。这类替换用脚本 + `newline=''` 读写更稳。
@@ -208,6 +215,7 @@ curl -X POST https://<域>/api/backfill \
 | 回环（重复建 issue） | 两个方向的真实事件 | GitHub #25（带 bug）→ Gitee 只出现一条镜像 IKH1WO，未再生成机器人建的 GitHub issue；Gitee 新建 IKH1YM（带 feature）→ GitHub 只有 #26 一条 |
 | 标签 | Gitee → GitHub | 建 issue 时把 Gitee 标签一起带上：`feature`（原本只在 Gitee）被自动建到 GitHub #26，颜色 B5CC18 与 Gitee 一致 |
 | 状态 | Gitee → GitHub（API 触发） | `PATCH … state=closed/open` 后约 10 秒收到 `issue_hooks/action=state_change`，GitHub #26 开关状态两次都跟随（修复前这条路径完全没被处理） |
+| 标签 | GitHub 模板带标签建 issue | 修掉「镜像创建把 GitHub 标签抹掉」后实测：新建 #31（带 `help wanted`，Gitee 建不出来的标签）标签全程保留、无 bot 摘标签动作；新建 #32（带 `bug`）Gitee 镜像 IKHD98 出生即带 `bug`，两侧标签都保住；两个测试件已关闭（#31/IKHD91、#32/IKHD98 两侧状态一致） |
 | 标签 | Gitee → GitHub（后续变更） | IKH0MO 在网页加上 `bug` 后，GitHub #24 由 `[enhancement]` 变为 `[bug, enhancement]`；Gitee 全程未投递标签事件，靠 `mode:"reconcile"` 拉取完成 |
 | 顺带对齐 | 一次真实的重开事件 | 同一次 `state_change` 事件里，Gitee 侧新增的 `documentation` 标签（从未投递过事件）被一并拉到 GitHub #26 |
 | 幂等性 | `/api/backfill mode=reconcile` 跑两遍（25 条 × 5 窗口） | 第二遍全部 `in_sync`，包括此前反复被写的 4 条（正文标注堆叠问题已修） |

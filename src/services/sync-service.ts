@@ -80,7 +80,7 @@ export class SyncService {
         return await this.handleGiteeIssueGeneric(event, eventId);
       }
 
-      if (result && result.success && event.issue && event.repository?.full_name) {
+      if (result && result.success && event.issue && event.repository?.full_name && event.action !== 'open') {
         const pulled = await this.pullAlignGiteeIssue(event.repository.full_name, event.issue);
         if (pulled) {
           result = { success: true, data: `${result.data}；顺带对齐：${pulled}` };
@@ -491,6 +491,14 @@ export class SyncService {
   }
 
   /**
+   * Gitee 的标签名规则（2~20 个字符、不能带冒号）。
+   * 用来判断「GitHub 上的某个标签在 Gitee 那边根本建不出来」，这类标签在对齐时不能删。
+   */
+  private isGiteeLabelNameValid(name: string): boolean {
+    return GiteeService.isLabelNameValid(name);
+  }
+
+  /**
    * 记录「这条成对 issue 刚做过一次完整比对」：Gitee 的 updated_at + 比对时间。
    * 下一轮对齐时若 Gitee 侧 updated_at 没变、且上次比对还比较新，就直接跳过
    * （未改动的成对 issue 只花 1 个子请求，这是能把全部 issue 放进一次调用的关键）。
@@ -611,8 +619,7 @@ export class SyncService {
       const giteeContent = this.stripSyncFooter(giteeIssue.body || '');
       const githubContent = this.stripSyncFooter(githubIssue.body || '');
       if (giteeContent !== githubContent) {
-        // 保留 GitHub 侧已有的来源标注（别把归属改来改去），没有才按 Gitee 来源补一个
-          // 保留 GitHub 侧已有的来源标注（堆叠多份时取最早那条 = 真实来源），没有才按 Gitee 来源补一个
+        // 保留 GitHub 侧已有的来源标注（堆叠多份时取最早那条 = 真实来源），没有才按 Gitee 来源补一个
         const existingFooter = this.extractSyncFooter(githubIssue.body || '');
         patch.body = existingFooter
           ? `${giteeContent}\n\n---\n${existingFooter}`
@@ -655,7 +662,12 @@ export class SyncService {
       if (giteeLabels) {
         const wanted = giteeLabels.map((label) => label.name).sort();
         const current = (githubIssue.labels || []).map((label) => label.name).sort();
-        if (wanted.join('|') !== current.join('|')) {
+        // Gitee 的标签名有硬性规则（2~20 位、不能带冒号），GitHub 上合法但 Gitee 建不出来的名字
+        // （例如 `type: bug`）永远不可能出现在 Gitee 的集合里。这类标签在对齐时不能删，
+        // 否则每轮「Gitee → GitHub」对齐都会把 GitHub 独有的它们抹一遍。
+        const unrepresentable = current.filter((name) => !this.isGiteeLabelNameValid(name));
+        const desired = Array.from(new Set([...wanted, ...unrepresentable])).sort();
+        if (desired.join('|') !== current.join('|')) {
           const ensureResult = await this.githubService.ensureRepoLabels(
             repoMapping.github_owner,
             repoMapping.github_repo,
@@ -664,16 +676,17 @@ export class SyncService {
           if (!ensureResult.success) {
             return { success: false, error: ensureResult.error };
           }
+          const finalLabels = Array.from(new Set([...(ensureResult.data || []), ...unrepresentable]));
           const labelResult = await this.githubService.setIssueLabels(
             repoMapping.github_owner,
             repoMapping.github_repo,
             issueMapping.github_issue_number,
-            ensureResult.data!
+            finalLabels
           );
           if (!labelResult.success) {
             return { success: false, error: labelResult.error };
           }
-          changed.push(`标签(${ensureResult.data!.join('、') || '清空'})`);
+          changed.push(`标签(${finalLabels.join('、') || '清空'})`);
         }
       }
 
@@ -875,11 +888,32 @@ export class SyncService {
         authorName
       );
 
+      // 先把标签在 Gitee 仓库里准备好（缺的按同名同色新建），创建时一并带上。
+      // 不能「先建 issue、再挂标签」：那段空窗期里 Gitee 会为我们的创建投递 open 事件，
+      // 顺风车对齐会把「暂时没标签」的镜像当权威源，反过来把 GitHub 的标签抹掉。
+      const wantedLabels = (event.issue.labels || [])
+        .map((label: any) => ({ name: String(label?.name || ''), color: label?.color }))
+        .filter((label: any) => label.name.length > 0);
+      let createLabels: string[] = [];
+      if (wantedLabels.length > 0) {
+        const ensureResult = await this.giteeService.ensureRepoLabels(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          wantedLabels
+        );
+        if (ensureResult.success) {
+          createLabels = ensureResult.data!;
+        } else {
+          console.warn(`准备 Gitee 标签失败（不影响创建 issue）: ${ensureResult.error}`);
+        }
+      }
+
       const createResult = await this.giteeService.createIssue(
         repoMapping.gitee_owner,
         repoMapping.gitee_repo,
         event.issue.title,
-        formattedBody
+        formattedBody,
+        createLabels
       );
       if (!createResult.success) {
         return { success: false, error: createResult.error };
@@ -1584,14 +1618,22 @@ export class SyncService {
   private async getIssueMappingByGithubWithRetry(
     githubIssueNumber: number,
     repositoryId: number,
-    delayMs = 4000
+    attempts = 5,
+    intervalMs = 2500
   ): Promise<IssueMapping | null> {
-    const first = await this.getIssueMappingByGithub(githubIssueNumber, repositoryId);
-    if (first) {
-      return first;
+    // 镜像创建是「建 issue → 挂标签 → 写映射」的多步流程（实测 6~7 秒），
+    // 用户在创建后立刻点标签/改标题时，事件会比映射先到。只等一次（4000ms）不够，
+    // 改成轮询：查到就走，最多等 attempts × intervalMs（默认 10 秒）。
+    for (let i = 0; i < attempts; i += 1) {
+      const found = await this.getIssueMappingByGithub(githubIssueNumber, repositoryId);
+      if (found) {
+        return found;
+      }
+      if (i < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    return await this.getIssueMappingByGithub(githubIssueNumber, repositoryId);
+    return null;
   }
 
   /**
