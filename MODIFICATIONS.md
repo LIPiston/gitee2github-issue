@@ -212,6 +212,8 @@ curl -X POST https://<域>/api/backfill \
 - 同步是事件驱动的，只对「Webhook 事件发生之后」的改动生效；上线前已在 GitHub 侧建好的 issue 用 `POST /api/backfill`（见第 7 节）补，并且接口本身也没有节流重试。
 - Gitee 端删除 issue 后映射会残留，目前是手动清理 + 日志提示；也可以做成检测到 404 自动清理映射，但 Gitee 偶发 404 会误删，需要权衡。
 - 批量回灌没有写入节流：GitHub 对“内容创建”有二级限速（约 80 次/分钟、500 次/小时），而上游实现没有重试与退避，撞上限速会静默丢失。
+- 补推的「成功」分支没法从外部构造验收：唯一能确定性造出 `held` 的手段是让 Gitee 存不下那个值（长标题），而那样补推也必然失败。失败分支已端到端验通（`repairFailed` 如实记录、GitHub 的值没被动），成功分支与之共用同一段代码，只差 Gitee 返回 200；真出现偶发失败时会在 `repaired` 里看到。
+- 对齐只比对标题/正文/标签，不比对状态：状态是事件驱动的，若某次状态推送失败，对齐不会补（这一条属于同一类「推送丢了就没人管」，目前只在内容与标签上修了）。
 
 ## 线上验证记录（2026-09-18 ~ 09-19，Cloudflare Worker 实测）
 
@@ -224,6 +226,8 @@ curl -X POST https://<域>/api/backfill \
 | GitHub → Gitee | 评论回写 | Gitee 评论 51264768 ↔ GitHub 评论 5730066539 |
 | 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
 | 对齐方向判定（#36，最终版本 0554f898 上复现） | 把 GitHub 标题改成 Gitee 存不下的 253 字长标题（推送必然失败 → 窗口长期存在）→ 定向对齐该条 | `action: held`、`held: ['标题']`、`changed: []`，GitHub 的新标题保住（修复前这里会把标题改回旧值）；随后正常事件把新标题追平到 Gitee |
+| 补推（对齐把 held 字段的 GitHub 值推回 Gitee） | #37 改成 Gitee 存不下的 253 字长标题（那次推送失败 → 把「刚比对过」的标记打脏）→ 全量对齐一轮 | `action: held`、`held: ['标题']`、`repairFailed: ['标题']`、`repaired: []`，GitHub 的 253 字标题原样保住；同一轮 40 对全部 `in_sync`、0 失败 |
+| 补推的触发前提（推送失败必须打脏） | 修前同样构造下对齐返回 `in_sync`（Gitee 的 `updated_at` 没变 → 被「未变动就跳过」短路，补推根本没机会跑） | 打脏（`verified_at = NULL`）后同一构造下重新比对并进入补推 |
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 | 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |
