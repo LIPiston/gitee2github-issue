@@ -1482,7 +1482,7 @@ export class SyncService {
       for (const { repoMapping, mapping } of batch) {
         const reconcileResult = await this.reconcileGiteeIssueToGithub(repoMapping, mapping);
         processed += 1;
-        const outcome = reconcileResult.data || { changed: [], held: [] };
+        const outcome = reconcileResult.data || { changed: [], held: [], repaired: [], repairFailed: [] };
         results.push({
           github_issue: `#${mapping.github_issue_number}`,
           gitee_issue: mapping.gitee_issue_number,
@@ -1495,6 +1495,10 @@ export class SyncService {
             : 'error',
           changed: outcome.changed,
           held: outcome.held,
+          // 补推（held 字段把 GitHub 的值推回 Gitee）的结果也要看得见，
+          // 否则外部无法区分「补推成功了」和「根本没跑」。
+          repaired: outcome.repaired || [],
+          repairFailed: outcome.repairFailed || [],
           detail: reconcileResult.success ? undefined : reconcileResult.error,
         });
         // 轻微节流，避免触发 GitHub 的二级限速
