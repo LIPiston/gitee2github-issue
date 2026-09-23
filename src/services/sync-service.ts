@@ -1192,24 +1192,13 @@ export class SyncService {
       }
       // 标题/正文写进了 Gitee：记下我们写进去的值（对齐时用来判断 Gitee 有没有被人改过，
       // 否则这之后任何一次对齐都可能把这次写入当成「Gitee 改的」，反过来覆盖 GitHub 上的新标题）
-      // 读回 Gitee 实际存下来的值再记快照：Gitee 会静默截断/规整标题正文，
-      // 记「我们请求的」而不是「它存下的」，下一步对齐就会误判成「人改的」并覆盖 GitHub。
-      const appliedIssue = await this.giteeService.getIssue(
-        repoMapping.gitee_owner,
-        repoMapping.gitee_repo,
-        issueMapping.gitee_issue_number
-      );
-      if (appliedIssue.success && appliedIssue.data) {
-        await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, {
-          title: appliedIssue.data.title ?? patch.title,
-          content: this.stripSyncFooter(appliedIssue.data.body ?? patch.body ?? ''),
-        });
-      } else {
-        await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, {
-          ...(patch.title !== undefined ? { title: patch.title } : {}),
-          ...(patch.body !== undefined ? { content: this.stripSyncFooter(patch.body) } : {}),
-        });
-      }
+      // 记「我们写进去的值」= 写入请求成功那一刻的值。**不要**改成写后读回：
+      // 读回要多一次 API 往返（约 1 秒），这段时间里快照会比 Gitee 的实际值新，
+      // 一旦有并发推送（用户连着改两下就会），对齐就会把 Gitee 的旧值误判成「人改的」并拉回 GitHub。
+      await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, {
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.body !== undefined ? { content: this.stripSyncFooter(patch.body) } : {}),
+      });
 
       await this.saveWebhookEvent(eventId, 'issue_edited', 'github');
       const what = [titleChanged ? '标题' : null, bodyChanged ? '正文' : null]
