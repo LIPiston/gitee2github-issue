@@ -480,6 +480,11 @@ export class SyncService {
         return { success: false, error: updateResult.error };
       }
 
+      // 状态基准跟着更新成 Gitee 的当前值（这里 Gitee 是权威源）：不更新的话快照会停在更早的
+      // 状态上，下一次对齐看到「Gitee 的状态和快照不一样」就会把它当成「人改的」再拉一遍
+      // （结果一样，但会误报 changed）。
+      await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, { state });
+
       await this.saveWebhookEvent(eventId, `issue_${state}`, 'gitee');
       return {
         success: true,
@@ -499,7 +504,9 @@ export class SyncService {
   }
 
   /** 解析 Gitee 快照（JSON：{title, bodyHash, labels}） */
-  private parseGiteeSnapshot(raw?: string | null): { title?: string; bodyHash?: string; labels?: string[] } | null {
+  private parseGiteeSnapshot(
+    raw?: string | null
+  ): { title?: string; bodyHash?: string; labels?: string[]; state?: string } | null {
     if (!raw) {
       return null;
     }
@@ -532,7 +539,7 @@ export class SyncService {
   private async saveGiteeSnapshot(
     repoMapping: RepositoryMapping,
     giteeIssueNumber: string,
-    patch: { title?: string; content?: string; labels?: string[] }
+    patch: { title?: string; content?: string; labels?: string[]; state?: string }
   ): Promise<void> {
     try {
       const row = await this.env.DB.prepare(
@@ -549,6 +556,9 @@ export class SyncService {
       }
       if (patch.labels !== undefined) {
         snapshot.labels = [...patch.labels].sort();
+      }
+      if (patch.state !== undefined) {
+        snapshot.state = patch.state.toLowerCase();
       }
       await this.env.DB.prepare(
         `UPDATE issue_mappings SET gitee_snapshot = ? WHERE repository_id = ? AND gitee_issue_number = ?`
@@ -770,6 +780,45 @@ export class SyncService {
         }
       }
 
+      // 状态：和标题/正文一样按快照判方向。只比对 open/closed —— Gitee 还有
+      // progressing / rejected 这类 GitHub 表达不了的状态，遇到就跳过不判。
+      // 老数据没有状态基准时**不动任何一侧**，只把 Gitee 的当前状态记成基准：
+      // 否则会一次性把「Gitee 优先」的老毛病带回来（拿 Gitee 的状态覆盖 GitHub，正是 #29/#36 那一类）。
+      const giteeState = (giteeIssue.state || '').toLowerCase();
+      const githubState = (githubIssue.state || '').toLowerCase();
+      const isComparableState = (value: string) => value === 'open' || value === 'closed';
+      let pullState: 'open' | 'closed' | undefined;
+      let repairState: 'open' | 'closed' | undefined;
+      if (isComparableState(giteeState) && isComparableState(githubState) && giteeState !== githubState) {
+        if (snapshot?.state === undefined) {
+          console.log(
+            `Gitee ${giteeNumber} 与 GitHub #${issueMapping.github_issue_number} 状态不一致` +
+              `（${giteeState} / ${githubState}），但还没有状态基准 → 本轮只记录，不动任何一侧`
+          );
+        } else if (giteeState === snapshot.state.toLowerCase()) {
+          held.push('状态');
+          repairState = githubState as 'open' | 'closed';
+          console.log(
+            `Gitee ${giteeNumber} 的状态与 GitHub #${issueMapping.github_issue_number} 不一致，` +
+              `但与我们上次写进 Gitee 的状态相同 → 判定为 GitHub 侧的新改动，不覆盖，改为补推给 Gitee`
+          );
+        } else {
+          pullState = giteeState as 'open' | 'closed';
+          changed.push('状态');
+        }
+      }
+      if (pullState) {
+        const stateResult = await this.githubService.updateIssueState(
+          repoMapping.github_owner,
+          repoMapping.github_repo,
+          issueMapping.github_issue_number,
+          pullState
+        );
+        if (!stateResult.success) {
+          return { success: false, error: stateResult.error };
+        }
+      }
+
       // 标签：Gitee → GitHub（反方向由 labeled / unlabeled 事件驱动）
       // 优先用 issue 详情里自带的 labels：单次调用的子请求数有硬上限（免费版 50），
       // 每省一次读取就能多扫几条 issue。只有详情没带这个字段时才单独去读。
@@ -837,6 +886,7 @@ export class SyncService {
       let repairedTitle: string | undefined;
       let repairedBody: string | undefined;
       let repairedLabels = false;
+      let repairedState: string | undefined;
       if (Object.keys(repair).length > 0) {
         const repairResult = await this.giteeService.updateIssueContent(
           repoMapping.gitee_owner,
@@ -874,6 +924,24 @@ export class SyncService {
           );
         }
       }
+      if (repairState) {
+        const stateRepair = await this.giteeService.updateIssueState(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          giteeNumber,
+          repairState
+        );
+        if (stateRepair.success) {
+          repaired.push('状态');
+          repairedState = repairState;
+          console.log(`已把 GitHub #${issueMapping.github_issue_number} 的状态补推到 Gitee ${giteeNumber}`);
+        } else {
+          repairFailed.push('状态');
+          console.warn(
+            `补推 GitHub #${issueMapping.github_issue_number} 的状态到 Gitee ${giteeNumber} 失败（下轮再试）: ${stateRepair.error}`
+          );
+        }
+      }
       if (repairLabels && repairLabels.length > 0) {
         // syncLabelsToGitee 自己会按读回值记标签快照，这里只负责别让下面的整体快照把它覆盖掉
         const labelRepair = await this.syncLabelsToGitee(repoMapping, giteeNumber, repairLabels, 'set');
@@ -899,6 +967,7 @@ export class SyncService {
           : giteeLabels
             ? giteeLabels.map((label) => label.name).sort()
             : undefined,
+        state: repairedState !== undefined ? repairedState : giteeState,
       });
 
       // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）。
@@ -1231,8 +1300,13 @@ export class SyncService {
         state
       );
       if (!updateResult.success) {
+        // 状态推送没送达：打脏，让下一轮对齐重新比对（否则状态也会像内容一样永久停在旧值）
+        await this.markIssueReconcileDirty(repoMapping.id, issueMapping.gitee_issue_number);
         return { success: false, error: updateResult.error };
       }
+
+      // 记下我们写进 Gitee 的状态：对齐时用它判断「Gitee 的状态是不是被人改过」
+      await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, { state });
 
       await this.saveWebhookEvent(eventId, `issue_${state}`, 'github');
       return {
