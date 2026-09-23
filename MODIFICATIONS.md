@@ -173,6 +173,20 @@ curl -X POST https://<域>/api/backfill \
 22. **「等映射」要轮询，不能只等一次**：镜像创建实测要 6~7 秒（建 issue → 准备标签 → 挂标签 → 写映射），而 GitHub 的 `labeled` / `issues.edited` 事件可能在这期间的任意时刻到达。原来只等一次 4000ms（#27 那次够用），#31 这次就不够了（日志：`GitHub #31 没有映射记录，跳过标签同步`）。改成轮询 `5 × 2500ms`，查到就走、最多 10 秒。
 23. **伪造的 `GitHub-Hookshot` UA 只对我们自己的 Worker 生效**：POST 到 `gitee.lipiston.eu.org` 时必须带它（否则被 Cloudflare 的 bot 规则 403、body 为空，看着像签名校验失败）；但拿它去调**真的** `api.github.com` 会被 GitHub 直接 403 并返回 HTML 页（看着像网络/代理问题）。调 GitHub API 用默认 UA 就好。
 
+24. **「对齐无条件信任 Gitee」是这一系列 bug 的总根**（#29 的标签被抹掉、#36 的标题被改回原名，都是它）：Gitee 不为标签/标题/正文投递事件，所以这个方向只能靠「拉」；但 **Gitee 的 `updated_at` 会被我们自己的写入顶新**（发镜像评论、改状态、挂标签都算），于是「Gitee 变了」根本不能证明是别人改的。用「谁更新谁赢」也不行——#36 现场：我们镜像过去的那条评论把 Gitee 顶成 `14:35:06`，比用户在 GitHub 的改名 `14:32:16` 还新，按时间戳判定照样会选错边。
+    **修法：记快照。** `issue_mappings.gitee_snapshot` 存「我们上次写进 Gitee 的 `{title, bodyHash, labels}`」，对齐时**按字段**比对：
+    - Gitee 当前值 == 快照 → Gitee 没被人动过 → 差异只可能来自 GitHub → **绝不覆盖 GitHub**（等 GitHub→Gitee 的事件同步）；
+    - Gitee 当前值 != 快照 → 是别人改的 → 才允许拉到 GitHub；
+    - 没有快照（老数据 / Gitee 原生镜像）→ 按老逻辑处理（Gitee 优先），行为不变。
+    标签的快照记**读回的真实值**、不记我们请求的名字：Gitee 对不合规的名字会静默丢弃，记成「我们以为的」就会把 Gitee 的真实状态误判成「被人改过」，反过来抹掉 GitHub 的标签。
+    **每次比对结束后把 Gitee 的当前值刷进快照**（它代表「双方认可的基准」）；不刷的话快照会停在更早那次写入上，下一次 GitHub 侧的改动又会被判成「Gitee 改的」而覆盖回去——同一类 bug 会第三次复发。
+    #36 的完整时间线（UTC，实测）：`14:32:16` 用户在 GitHub 改名 `[Feature] → [Docs]` → `14:35:07` 我们把他在 GitHub 的评论镜像到 Gitee（Gitee 的 `updated_at` 因此变成 `14:35:06`）→ Gitee 为这条镜像评论投递 comment 事件 → `14:35:12` 顺风车对齐读到 Gitee 的旧标题并写回 GitHub（时间线里表现为 `renamed by openrevo-issue-sync-bot[bot]`）→ `14:35:18` 改名事件才被处理（晚了约 3 分钟）。**要复现这类问题，看的不是"事件有没有到"，而是"事件到达之前有没有别的东西触发了对齐"。**
+    **让判定可观测**：对齐结果除了 `changed`（真写了的字段）再加一个 `held`（有差异、但判定为「GitHub 侧新改动」因而没覆盖的字段），管理员接口的 `action` 相应多一档 `held`。否则「挡住了」和「本来就没差异」在返回值里长得一模一样，验收和事后排查都分不清。
+    **快照要记「Gitee 实际存下来的值」**，不是「我们请求的值」：Gitee 对标签会静默丢弃不合规名字、对标题/正文可能截断或规整，所以标签按读回值记，标题/正文用创建响应/写后读回的值记。记错方向会让对齐把 Gitee 的真实状态误判成「被人改过」，又反过来覆盖 GitHub。
+    **已知边界**：这条守卫是保守的——判定为「GitHub 侧改动」时只记日志、不反向补写 Gitee。所以如果 GitHub→Gitee 的事件真的丢了，两侧会一直不一致（重新在 GitHub 编辑一次那个字段即可修复）。这是有意为之：宁可留着差异，也不拿一边的内容去覆盖另一边。
+    **本机 Gitee 令牌写不了**（2026-09-24 实测）：配置单里那个令牌只能读（`GET` 正常），任何写操作都返回 `404 Not Found Project`（`PATCH`）/ HTML 400（标签），与「令牌缺 `issues` 权限」的症状一致；worker 里 `GITEE_TOKEN` 这个 secret 是好的。要在本机做 Gitee 写操作（例如造一个「Gitee 侧被人改过」的场景）得换新令牌，或者直接在 Gitee 网页上手动改。
+
+
 15. **「API 改动不触发 webhook」这个结论是错的**：Gitee 用 API 改状态**会**投递（`state_change`，实测约 10 秒内到）。当初判「不触发」是因为测的 issue 已经处于目标状态——**状态没变，Gitee 就不发事件**。要分辨「没投递」和「投递了我没处理」，先确认操作真的改变了状态，再开 `wrangler tail` 看请求到没到（注意 tail 的日志条目**只带请求头、不带 body**，别指望从那里面读 action；未处理的 Gitee 事件会以 `unhandled:<hook>:<action>` 落库，这才是查 action 名的地方）。
 16. **`wrangler tail --format json` 的输出是美化过的、跨多行的**：按 `\n{` 切块会漏解析，改用 `json.JSONDecoder().raw_decode()` 逐个取对象。
 17. **改代码时别在正则里写 `\r`**：补丁工具会把 `\r?\n` 解析成真实回车，把正则拆成多行、直接编译不过（本次踩到，最后改成按行扫描的函数）。这类替换用脚本 + `newline=''` 读写更稳。
@@ -208,6 +222,7 @@ curl -X POST https://<域>/api/backfill \
 | GitHub → Gitee | 关闭 / 重开 | Gitee issue 状态跟着变（closed / open） |
 | GitHub → Gitee | 评论回写 | Gitee 评论 51264768 ↔ GitHub 评论 5730066539 |
 | 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
+| 对齐方向判定（#36） | GitHub 侧连改 8 下 → 趁推送没追平定向对齐该条 | `action: held`、`held: ['标题']`、`changed: []`，GitHub 的新标题保住（修复前这里会把标题改回旧值）；随后正常事件把新标题追平到 Gitee |
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 | 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |

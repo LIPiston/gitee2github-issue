@@ -39,6 +39,8 @@ export interface IssueMapping {
   gitee_updated_at?: string | null;
   /** 上次完整比对的时间（ISO）：超过 FULL_VERIFY_INTERVAL_MS 会强制再完整比一次 */
   verified_at?: string | null;
+  /** 我们上一次写进 Gitee 的标题/正文/标签快照（JSON）：用来判断 Gitee 是不是被人改过 */
+  gitee_snapshot?: string | null;
 }
 
 // 评论映射类型

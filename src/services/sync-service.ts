@@ -498,6 +498,68 @@ export class SyncService {
     return GiteeService.isLabelNameValid(name);
   }
 
+  /** 解析 Gitee 快照（JSON：{title, bodyHash, labels}） */
+  private parseGiteeSnapshot(raw?: string | null): { title?: string; bodyHash?: string; labels?: string[] } | null {
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 稳定的字符串哈希（只用于比对，不需要抗碰撞强度） */
+  private hashText(text: string): string {
+    let h = 5381;
+    for (let i = 0; i < text.length; i += 1) {
+      h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  /**
+   * 记下「我们刚写进 Gitee 的标题 / 正文 / 标签」。
+   *
+   * 为什么需要它：Gitee 不为标签/标题/正文的改动投递事件，只能靠「拉」对齐；而 Gitee 的
+   * updated_at 会被**我们自己的写入**顶新（发镜像评论、改状态、挂标签都算），所以「updated_at
+   * 变了」证明不了是别人改的。拿 Gitee 的当前值和我们写进去的快照比就分得清：
+   *   一样   → Gitee 没被人动过，差异只可能来自 GitHub 侧 → 绝不能用 Gitee 覆盖 GitHub；
+   *   不一样 → Gitee 被人改了 → 才允许拉到 GitHub。
+   * 这两次误判（#29 的标签被抹、#36 的标题被改回原名）都是因为当时只会「Gitee 优先」。
+   */
+  private async saveGiteeSnapshot(
+    repoMapping: RepositoryMapping,
+    giteeIssueNumber: string,
+    patch: { title?: string; content?: string; labels?: string[] }
+  ): Promise<void> {
+    try {
+      const row = await this.env.DB.prepare(
+        `SELECT gitee_snapshot FROM issue_mappings WHERE repository_id = ? AND gitee_issue_number = ?`
+      )
+        .bind(repoMapping.id, giteeIssueNumber)
+        .first<{ gitee_snapshot?: string | null }>();
+      const snapshot = this.parseGiteeSnapshot(row?.gitee_snapshot) || {};
+      if (patch.title !== undefined) {
+        snapshot.title = patch.title;
+      }
+      if (patch.content !== undefined) {
+        snapshot.bodyHash = this.hashText(patch.content);
+      }
+      if (patch.labels !== undefined) {
+        snapshot.labels = [...patch.labels].sort();
+      }
+      await this.env.DB.prepare(
+        `UPDATE issue_mappings SET gitee_snapshot = ? WHERE repository_id = ? AND gitee_issue_number = ?`
+      )
+        .bind(JSON.stringify(snapshot), repoMapping.id, giteeIssueNumber)
+        .run();
+    } catch (error) {
+      console.warn(`记录 Gitee 快照失败（不影响同步）: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /**
    * 记录「这条成对 issue 刚做过一次完整比对」：Gitee 的 updated_at + 比对时间。
    * 下一轮对齐时若 Gitee 侧 updated_at 没变、且上次比对还比较新，就直接跳过
@@ -569,7 +631,7 @@ export class SyncService {
   private async reconcileGiteeIssueToGithub(
     repoMapping: RepositoryMapping,
     issueMapping: IssueMapping
-  ): Promise<Result<string[]>> {
+  ): Promise<Result<{ changed: string[]; held: string[] }>> {
     try {
       const giteeNumber = issueMapping.gitee_issue_number;
       if (!giteeNumber) {
@@ -595,7 +657,7 @@ export class SyncService {
       const verifiedRecently =
         Number.isFinite(verifiedAt) && Date.now() - verifiedAt < FULL_VERIFY_INTERVAL_MS;
       if (giteeUpdatedAt && issueMapping.gitee_updated_at === giteeUpdatedAt && verifiedRecently) {
-        return { success: true, data: [] };
+        return { success: true, data: { changed: [], held: [] } };
       }
 
       const githubResult = await this.githubService.getIssue(
@@ -608,27 +670,57 @@ export class SyncService {
       }
       const githubIssue = githubResult.data!;
 
+      // Gitee 侧到底有没有被人改过？拿 Gitee 的当前值和我们上次写进去的快照比。
+      // Gitee 不为标签/标题/正文投递事件，而它的 updated_at 会被**我们自己的写入**顶新
+      // （发镜像评论、改状态、挂标签都算），所以时间戳证明不了什么。只有「Gitee 的值和我们
+      // 写进去的不一样」才说明是人改的；一样就说明差异只可能来自 GitHub 侧，绝不能覆盖 GitHub
+      // （#29 的标签、#36 的标题都是被「Gitee 优先」这条老逻辑抹掉的）。
+      // 没有快照（老数据 / Gitee 原生镜像）时按老逻辑处理，行为不变。
+      const snapshot = this.parseGiteeSnapshot(issueMapping.gitee_snapshot);
+      const giteeTitleByOthers =
+        snapshot?.title === undefined ? true : (giteeIssue.title || '') !== snapshot.title;
+
       const changed: string[] = [];
+      /** 两侧不一致、但判定为「GitHub 侧的新改动」因而没覆盖的字段（只记日志的话没人看得见） */
+      const held: string[] = [];
       const patch: { title?: string; body?: string } = {};
 
       if ((giteeIssue.title || '') !== (githubIssue.title || '')) {
-        patch.title = giteeIssue.title;
-        changed.push('标题');
+        if (giteeTitleByOthers) {
+          patch.title = giteeIssue.title;
+          changed.push('标题');
+        } else {
+          held.push('标题');
+          console.log(
+            `Gitee ${giteeNumber} 的标题与 GitHub #${issueMapping.github_issue_number} 不一致，` +
+              `但与我们上次写进 Gitee 的标题相同 → 判定为 GitHub 侧的新改动，不覆盖（等 GitHub→Gitee 的事件同步）`
+          );
+        }
       }
 
       const giteeContent = this.stripSyncFooter(giteeIssue.body || '');
       const githubContent = this.stripSyncFooter(githubIssue.body || '');
+      const giteeBodyByOthers =
+        snapshot?.bodyHash === undefined ? true : this.hashText(giteeContent) !== snapshot.bodyHash;
       if (giteeContent !== githubContent) {
-        // 保留 GitHub 侧已有的来源标注（堆叠多份时取最早那条 = 真实来源），没有才按 Gitee 来源补一个
-        const existingFooter = this.extractSyncFooter(githubIssue.body || '');
-        patch.body = existingFooter
-          ? `${giteeContent}\n\n---\n${existingFooter}`
-          : this.githubService.formatIssueBody(
-              giteeContent,
-              giteeIssue.html_url,
-              giteeIssue.user?.login || 'unknown'
-            );
-        changed.push('正文');
+        if (giteeBodyByOthers) {
+          // 保留 GitHub 侧已有的来源标注（堆叠多份时取最早那条 = 真实来源），没有才按 Gitee 来源补一个
+          const existingFooter = this.extractSyncFooter(githubIssue.body || '');
+          patch.body = existingFooter
+            ? `${giteeContent}\n\n---\n${existingFooter}`
+            : this.githubService.formatIssueBody(
+                giteeContent,
+                giteeIssue.html_url,
+                giteeIssue.user?.login || 'unknown'
+              );
+          changed.push('正文');
+        } else {
+          held.push('正文');
+          console.log(
+            `Gitee ${giteeNumber} 的正文与 GitHub #${issueMapping.github_issue_number} 不一致，` +
+              `但与我们上次写进 Gitee 的正文相同 → 判定为 GitHub 侧的新改动，不覆盖`
+          );
+        }
       }
 
       if (Object.keys(patch).length > 0) {
@@ -667,7 +759,18 @@ export class SyncService {
         // 否则每轮「Gitee → GitHub」对齐都会把 GitHub 独有的它们抹一遍。
         const unrepresentable = current.filter((name) => !this.isGiteeLabelNameValid(name));
         const desired = Array.from(new Set([...wanted, ...unrepresentable])).sort();
-        if (desired.join('|') !== current.join('|')) {
+        const giteeLabelsByOthers =
+          snapshot?.labels === undefined
+            ? true
+            : wanted.join('|') !== [...snapshot.labels].sort().join('|');
+        if (desired.join('|') !== current.join('|') && !giteeLabelsByOthers) {
+          held.push(`标签(${current.join('、')})`);
+          console.log(
+            `Gitee ${giteeNumber} 的标签与 GitHub #${issueMapping.github_issue_number} 不一致，` +
+              `但与我们上次写进 Gitee 的标签相同 → 判定为 GitHub 侧的新改动，不覆盖`
+          );
+        }
+        if (desired.join('|') !== current.join('|') && giteeLabelsByOthers) {
           const ensureResult = await this.githubService.ensureRepoLabels(
             repoMapping.github_owner,
             repoMapping.github_repo,
@@ -690,10 +793,19 @@ export class SyncService {
         }
       }
 
+      // 这次比对之后，Gitee 的当前值就是「双方认可的基准」：记进快照。
+      // 不记的话，快照会一直停留在更早的那次写入上，于是下一次 GitHub 侧的改动又会被
+      // 判成「Gitee 改的」而覆盖回去（同一类 bug 的第三次复发）。
+      await this.saveGiteeSnapshot(repoMapping, giteeNumber, {
+        title: giteeIssue.title || '',
+        content: giteeContent,
+        labels: giteeLabels ? giteeLabels.map((label) => label.name).sort() : undefined,
+      });
+
       // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）
       await this.saveIssueReconcileStamp(issueMapping.id, giteeUpdatedAt);
 
-      return { success: true, data: changed };
+      return { success: true, data: { changed, held } };
     } catch (error) {
       return {
         success: false,
@@ -732,13 +844,17 @@ export class SyncService {
       }
 
       await this.saveWebhookEvent(eventId, `issue_${event.action || 'update'}`, 'gitee');
-      const changed = reconcileResult.data || [];
+      const { changed = [], held = [] } = reconcileResult.data || {};
+      const heldNote =
+        held.length > 0
+          ? `；${held.join('、')}与 GitHub 不一致，但判定为 GitHub 侧的新改动，未覆盖`
+          : '';
       return {
         success: true,
         data:
           changed.length > 0
-            ? `已把 Gitee ${event.issue.number} 的改动对齐到 GitHub #${issueMapping.github_issue_number}（${changed.join('、')}）`
-            : `Gitee ${event.issue.number} 与 GitHub #${issueMapping.github_issue_number} 已一致，无需改动`,
+            ? `已把 Gitee ${event.issue.number} 的改动对齐到 GitHub #${issueMapping.github_issue_number}（${changed.join('、')}）${heldNote}`
+            : `Gitee ${event.issue.number} 与 GitHub #${issueMapping.github_issue_number} 已一致，无需改动${heldNote}`,
       };
     } catch (error) {
       return {
@@ -777,10 +893,17 @@ export class SyncService {
         return null;
       }
 
-      const changed = reconcileResult.data || [];
-      return changed.length > 0
-        ? `Gitee ${issue.number} 的${changed.join('、')}已对齐到 GitHub #${issueMapping.github_issue_number}`
-        : null;
+      const { changed = [], held = [] } = reconcileResult.data || {};
+      const parts: string[] = [];
+      if (changed.length > 0) {
+        parts.push(`Gitee ${issue.number} 的${changed.join('、')}已对齐到 GitHub #${issueMapping.github_issue_number}`);
+      }
+      if (held.length > 0) {
+        parts.push(
+          `Gitee ${issue.number} 的${held.join('、')}与 GitHub 不一致，但判定为 GitHub 侧的新改动，未覆盖`
+        );
+      }
+      return parts.length > 0 ? parts.join('；') : null;
     } catch (error) {
       console.warn(`顺带对齐异常: ${error instanceof Error ? error.message : String(error)}`);
       return null;
@@ -937,6 +1060,14 @@ export class SyncService {
         'set'
       );
 
+      // 记下我们刚写进 Gitee 的标题/正文。用**创建响应里返回的值**（Gitee 的真实存储值），
+      // 不是我们请求的值：Gitee 可能对标题/正文做截断或规整，快照一旦记成「我们以为的」，
+      // 之后对齐就会把 Gitee 的真实状态判成「被人改过」，反过来覆盖 GitHub。
+      await this.saveGiteeSnapshot(repoMapping, String(giteeIssue.number), {
+        title: giteeIssue.title ?? event.issue.title,
+        content: this.stripSyncFooter(giteeIssue.body ?? formattedBody),
+      });
+
       await this.saveWebhookEvent(eventId, 'issue_create', 'github');
       return {
         success: true,
@@ -1059,6 +1190,26 @@ export class SyncService {
       if (!updateResult.success) {
         return { success: false, error: updateResult.error };
       }
+      // 标题/正文写进了 Gitee：记下我们写进去的值（对齐时用来判断 Gitee 有没有被人改过，
+      // 否则这之后任何一次对齐都可能把这次写入当成「Gitee 改的」，反过来覆盖 GitHub 上的新标题）
+      // 读回 Gitee 实际存下来的值再记快照：Gitee 会静默截断/规整标题正文，
+      // 记「我们请求的」而不是「它存下的」，下一步对齐就会误判成「人改的」并覆盖 GitHub。
+      const appliedIssue = await this.giteeService.getIssue(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        issueMapping.gitee_issue_number
+      );
+      if (appliedIssue.success && appliedIssue.data) {
+        await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, {
+          title: appliedIssue.data.title ?? patch.title,
+          content: this.stripSyncFooter(appliedIssue.data.body ?? patch.body ?? ''),
+        });
+      } else {
+        await this.saveGiteeSnapshot(repoMapping, issueMapping.gitee_issue_number, {
+          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(patch.body !== undefined ? { content: this.stripSyncFooter(patch.body) } : {}),
+        });
+      }
 
       await this.saveWebhookEvent(eventId, 'issue_edited', 'github');
       const what = [titleChanged ? '标题' : null, bodyChanged ? '正文' : null]
@@ -1103,6 +1254,8 @@ export class SyncService {
 
       const names = ensureResult.data!;
       if (names.length === 0) {
+        // 没有要挂的标签：Gitee 侧就是空的，快照也记成空的（否则对齐会把「Gitee 没有」误判成人改的）
+        await this.saveGiteeSnapshot(repoMapping, giteeIssueNumber, { labels: [] });
         return { success: true, data: [] };
       }
 
@@ -1123,6 +1276,20 @@ export class SyncService {
       if (!writeResult.success) {
         return { success: false, error: writeResult.error };
       }
+
+      // 快照记「Gitee 实际挂上的标签」（读回），不是我们请求的名字：
+      // Gitee 对不合规的名字会静默丢弃，快照一旦记成「我们以为的」，对齐就会把
+      // Gitee 的真实状态当成「被人改过」，反过来抹掉 GitHub 上的标签。
+      let applied = names;
+      const readBack = await this.giteeService.getIssueLabels(
+        repoMapping.gitee_owner,
+        repoMapping.gitee_repo,
+        giteeIssueNumber
+      );
+      if (readBack.success && readBack.data) {
+        applied = readBack.data.map((label) => label.name);
+      }
+      await this.saveGiteeSnapshot(repoMapping, giteeIssueNumber, { labels: applied });
 
       return { success: true, data: names };
     } catch (error) {
@@ -1248,15 +1415,19 @@ export class SyncService {
       for (const { repoMapping, mapping } of batch) {
         const reconcileResult = await this.reconcileGiteeIssueToGithub(repoMapping, mapping);
         processed += 1;
+        const outcome = reconcileResult.data || { changed: [], held: [] };
         results.push({
           github_issue: `#${mapping.github_issue_number}`,
           gitee_issue: mapping.gitee_issue_number,
           action: reconcileResult.success
-            ? (reconcileResult.data || []).length > 0
+            ? outcome.changed.length > 0
               ? 'reconciled'
-              : 'in_sync'
+              : outcome.held.length > 0
+                ? 'held'
+                : 'in_sync'
             : 'error',
-          changed: reconcileResult.data || [],
+          changed: outcome.changed,
+          held: outcome.held,
           detail: reconcileResult.success ? undefined : reconcileResult.error,
         });
         // 轻微节流，避免触发 GitHub 的二级限速
