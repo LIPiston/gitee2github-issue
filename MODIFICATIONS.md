@@ -184,7 +184,8 @@ curl -X POST https://<域>/api/backfill \
     **让判定可观测**：对齐结果除了 `changed`（真写了的字段）再加一个 `held`（有差异、但判定为「GitHub 侧新改动」因而没覆盖的字段），管理员接口的 `action` 相应多一档 `held`。否则「挡住了」和「本来就没差异」在返回值里长得一模一样，验收和事后排查都分不清。
     **快照要记「Gitee 实际存下来的值」**，不是「我们请求的值」：Gitee 对标签会静默丢弃不合规名字、对标题/正文可能截断或规整，所以标签按读回值记，标题/正文用创建响应/写后读回的值记。记错方向会让对齐把 Gitee 的真实状态误判成「被人改过」，又反过来覆盖 GitHub。
     **已知边界**：这条守卫是保守的——判定为「GitHub 侧改动」时只记日志、不反向补写 Gitee。所以如果 GitHub→Gitee 的事件真的丢了，两侧会一直不一致（重新在 GitHub 编辑一次那个字段即可修复）。这是有意为之：宁可留着差异，也不拿一边的内容去覆盖另一边。
-    **本机 Gitee 令牌写不了**（2026-09-24 实测）：配置单里那个令牌只能读（`GET` 正常），任何写操作都返回 `404 Not Found Project`（`PATCH`）/ HTML 400（标签），与「令牌缺 `issues` 权限」的症状一致；worker 里 `GITEE_TOKEN` 这个 secret 是好的。要在本机做 Gitee 写操作（例如造一个「Gitee 侧被人改过」的场景）得换新令牌，或者直接在 Gitee 网页上手动改。
+        **可重复的验收构造**：想让「GitHub 已改、Gitee 还是旧值、快照仍等于 Gitee」这个窗口稳定存在，把 GitHub 的标题改成 Gitee 存不下的长标题（实测 253 字会被 Gitee 拒，推送失败 → 快照不更新 → 窗口不会自己消失）；然后定向对齐该条（`{"mode":"reconcile","limit":1,"offset":<该条的序号>}`），期望 `action: held`。比「连改多下抢时间窗」靠谱得多——后者要靠本机到 Worker 的延迟碰运气。
+**本机 Gitee 令牌写不了**（2026-09-24 实测）：配置单里那个令牌只能读（`GET` 正常），任何写操作都返回 `404 Not Found Project`（`PATCH`）/ HTML 400（标签），与「令牌缺 `issues` 权限」的症状一致；worker 里 `GITEE_TOKEN` 这个 secret 是好的。要在本机做 Gitee 写操作（例如造一个「Gitee 侧被人改过」的场景）得换新令牌，或者直接在 Gitee 网页上手动改。
 
 
 15. **「API 改动不触发 webhook」这个结论是错的**：Gitee 用 API 改状态**会**投递（`state_change`，实测约 10 秒内到）。当初判「不触发」是因为测的 issue 已经处于目标状态——**状态没变，Gitee 就不发事件**。要分辨「没投递」和「投递了我没处理」，先确认操作真的改变了状态，再开 `wrangler tail` 看请求到没到（注意 tail 的日志条目**只带请求头、不带 body**，别指望从那里面读 action；未处理的 Gitee 事件会以 `unhandled:<hook>:<action>` 落库，这才是查 action 名的地方）。
@@ -222,7 +223,7 @@ curl -X POST https://<域>/api/backfill \
 | GitHub → Gitee | 关闭 / 重开 | Gitee issue 状态跟着变（closed / open） |
 | GitHub → Gitee | 评论回写 | Gitee 评论 51264768 ↔ GitHub 评论 5730066539 |
 | 回环抑制 | 重复事件 | 返回「已经是 xxx 状态，跳过」，不再产生写回 |
-| 对齐方向判定（#36） | GitHub 侧连改 8 下 → 趁推送没追平定向对齐该条 | `action: held`、`held: ['标题']`、`changed: []`，GitHub 的新标题保住（修复前这里会把标题改回旧值）；随后正常事件把新标题追平到 Gitee |
+| 对齐方向判定（#36，最终版本 0554f898 上复现） | 把 GitHub 标题改成 Gitee 存不下的 253 字长标题（推送必然失败 → 窗口长期存在）→ 定向对齐该条 | `action: held`、`held: ['标题']`、`changed: []`，GitHub 的新标题保住（修复前这里会把标题改回旧值）；随后正常事件把新标题追平到 Gitee |
 | 软跳过 | 未映射 issue 的事件 | HTTP 200 + 说明文字（此前是 400） |
 | 回灌 | `POST /api/backfill` | 12 条历史 issue 补建到 Gitee（#10/#4 连关闭状态一起镜像），映射总数 15，GitHub 侧未多出一条 |
 | 标签 | GitHub → Gitee | 创建时复制、`labeled`/`unlabeled` 同步、缺失标签自动在 Gitee 建同名同色（accessibility、documentation 实测建出）；历史成对 issue 的标签用 `mode:"labels"` 补齐 8 条 |
