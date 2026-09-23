@@ -385,7 +385,7 @@ export class GitHubService {
     owner: string,
     repo: string,
     issueNumber: number,
-  ): Promise<Result<{ title: string; body: string; state: string; html_url: string; labels: Array<{ name: string; color?: string }> }>> {
+  ): Promise<Result<{ title: string; body: string; state: string; html_url: string; user: { login: string }; labels: Array<{ name: string; color?: string }> }>> {
     try {
       const octokit = await this.octokitFor(owner, repo);
       const response = await octokit.issues.get({ owner, repo, issue_number: issueNumber });
@@ -396,6 +396,7 @@ export class GitHubService {
           body: response.data.body || '',
           state: response.data.state,
           html_url: response.data.html_url,
+          user: { login: response.data.user?.login || 'unknown' },
           labels: (response.data.labels || []).map((label: any) =>
             typeof label === 'string'
               ? { name: label as string }

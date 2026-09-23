@@ -631,7 +631,7 @@ export class SyncService {
   private async reconcileGiteeIssueToGithub(
     repoMapping: RepositoryMapping,
     issueMapping: IssueMapping
-  ): Promise<Result<{ changed: string[]; held: string[] }>> {
+  ): Promise<Result<{ changed: string[]; held: string[]; repaired: string[]; repairFailed: string[] }>> {
     try {
       const giteeNumber = issueMapping.gitee_issue_number;
       if (!giteeNumber) {
@@ -657,7 +657,7 @@ export class SyncService {
       const verifiedRecently =
         Number.isFinite(verifiedAt) && Date.now() - verifiedAt < FULL_VERIFY_INTERVAL_MS;
       if (giteeUpdatedAt && issueMapping.gitee_updated_at === giteeUpdatedAt && verifiedRecently) {
-        return { success: true, data: { changed: [], held: [] } };
+        return { success: true, data: { changed: [], held: [], repaired: [], repairFailed: [] } };
       }
 
       const githubResult = await this.githubService.getIssue(
@@ -684,6 +684,14 @@ export class SyncService {
       /** 两侧不一致、但判定为「GitHub 侧的新改动」因而没覆盖的字段（只记日志的话没人看得见） */
       const held: string[] = [];
       const patch: { title?: string; body?: string } = {};
+      // 判定为 held 的字段 = 「Gitee 没被人动过，只是我们那次推送没送达」（Gitee 报错/被拒/被静默丢弃）。
+      // 对齐顺手把 GitHub 的值补推一次，否则镜像会永久停在旧值上：实测连改多下时某次推送撞上 Gitee 525，
+      // 之后 GitHub 一直是最新、Gitee 落后两个版本，而且再也不会自己追平（对齐过去只拉不推）。
+      const repair: { title?: string; body?: string } = {};
+      let repairLabels: Array<{ name: string; color?: string }> | null = null;
+      /** 补推成功 / 失败的字段（只记日志的话，外部看不出补推到底跑没跑、成没成） */
+      const repaired: string[] = [];
+      const repairFailed: string[] = [];
 
       if ((giteeIssue.title || '') !== (githubIssue.title || '')) {
         if (giteeTitleByOthers) {
@@ -691,9 +699,10 @@ export class SyncService {
           changed.push('标题');
         } else {
           held.push('标题');
+          repair.title = githubIssue.title;
           console.log(
             `Gitee ${giteeNumber} 的标题与 GitHub #${issueMapping.github_issue_number} 不一致，` +
-              `但与我们上次写进 Gitee 的标题相同 → 判定为 GitHub 侧的新改动，不覆盖（等 GitHub→Gitee 的事件同步）`
+              `但与我们上次写进 Gitee 的标题相同 → 判定为 GitHub 侧的新改动，不覆盖，改为把 GitHub 的值补推给 Gitee`
           );
         }
       }
@@ -716,9 +725,14 @@ export class SyncService {
           changed.push('正文');
         } else {
           held.push('正文');
+          repair.body = this.githubService.formatIssueBody(
+            this.stripSyncFooter(githubIssue.body || ''),
+            githubIssue.html_url,
+            githubIssue.user?.login || 'unknown'
+          );
           console.log(
             `Gitee ${giteeNumber} 的正文与 GitHub #${issueMapping.github_issue_number} 不一致，` +
-              `但与我们上次写进 Gitee 的正文相同 → 判定为 GitHub 侧的新改动，不覆盖`
+              `但与我们上次写进 Gitee 的正文相同 → 判定为 GitHub 侧的新改动，不覆盖，改为补推给 Gitee`
           );
         }
       }
@@ -765,9 +779,12 @@ export class SyncService {
             : wanted.join('|') !== [...snapshot.labels].sort().join('|');
         if (desired.join('|') !== current.join('|') && !giteeLabelsByOthers) {
           held.push(`标签(${current.join('、')})`);
+          repairLabels = (githubIssue.labels || [])
+            .filter((label) => this.isGiteeLabelNameValid(label.name))
+            .map((label) => ({ name: label.name, color: label.color }));
           console.log(
             `Gitee ${giteeNumber} 的标签与 GitHub #${issueMapping.github_issue_number} 不一致，` +
-              `但与我们上次写进 Gitee 的标签相同 → 判定为 GitHub 侧的新改动，不覆盖`
+              `但与我们上次写进 Gitee 的标签相同 → 判定为 GitHub 侧的新改动，不覆盖，改为补推给 Gitee`
           );
         }
         if (desired.join('|') !== current.join('|') && giteeLabelsByOthers) {
@@ -793,19 +810,80 @@ export class SyncService {
         }
       }
 
+      // 补推：held 的字段，把 GitHub 的值推给 Gitee（这些字段的快照已证明 Gitee 没被人动过）。
+      // 推成功就按「我们刚推上去的值」记快照，不按开始时读到的旧值——否则下一轮会把 Gitee 的
+      // 新值当成「人改的」再拉一次（结果一样，但会误报 changed，也会让 held 一直亮着）。
+      let repairedTitle: string | undefined;
+      let repairedBody: string | undefined;
+      let repairedLabels = false;
+      if (Object.keys(repair).length > 0) {
+        const repairResult = await this.giteeService.updateIssueContent(
+          repoMapping.gitee_owner,
+          repoMapping.gitee_repo,
+          giteeNumber,
+          repair
+        );
+        const repairFields = [
+          repair.title !== undefined ? '标题' : null,
+          repair.body !== undefined ? '正文' : null,
+        ].filter((name): name is string => Boolean(name));
+        if (repairResult.success) {
+          // 补推成功后读回 Gitee 的实际值再记快照（和标签一样的道理：Gitee 可能规整/截断）。
+          // 这次多花一个子请求是值得的：若快照记成「我们请求的值」而 Gitee 存的是另一个值，
+          // 下一轮就会把 Gitee 的值当成「人改的」拉到 GitHub（#36 那一类误判）。
+          // 反过来，读回值哪怕被并发推送顶掉，后果也只是下一轮多拉一次——那时两侧本就相同，是空操作。
+          const readBack = await this.giteeService.getIssue(
+            repoMapping.gitee_owner,
+            repoMapping.gitee_repo,
+            giteeNumber
+          );
+          if (readBack.success && readBack.data) {
+            repairedTitle = readBack.data.title || '';
+            repairedBody = this.stripSyncFooter(readBack.data.body || '');
+          } else {
+            repairedTitle = repair.title;
+            repairedBody = repair.body;
+          }
+          repaired.push(...repairFields);
+          console.log(`已把 GitHub #${issueMapping.github_issue_number} 的改动补推到 Gitee ${giteeNumber}`);
+        } else {
+          repairFailed.push(...repairFields);
+          console.warn(
+            `补推 GitHub #${issueMapping.github_issue_number} 的改动到 Gitee ${giteeNumber} 失败（下轮再试）: ${repairResult.error}`
+          );
+        }
+      }
+      if (repairLabels && repairLabels.length > 0) {
+        // syncLabelsToGitee 自己会按读回值记标签快照，这里只负责别让下面的整体快照把它覆盖掉
+        const labelRepair = await this.syncLabelsToGitee(repoMapping, giteeNumber, repairLabels, 'set');
+        if (labelRepair.success) {
+          repairedLabels = true;
+          repaired.push('标签');
+        } else {
+          repairFailed.push('标签');
+          console.warn(
+            `补推 GitHub #${issueMapping.github_issue_number} 的标签到 Gitee ${giteeNumber} 失败（下轮再试）: ${labelRepair.error}`
+          );
+        }
+      }
+
       // 这次比对之后，Gitee 的当前值就是「双方认可的基准」：记进快照。
       // 不记的话，快照会一直停留在更早的那次写入上，于是下一次 GitHub 侧的改动又会被
       // 判成「Gitee 改的」而覆盖回去（同一类 bug 的第三次复发）。
       await this.saveGiteeSnapshot(repoMapping, giteeNumber, {
-        title: giteeIssue.title || '',
-        content: giteeContent,
-        labels: giteeLabels ? giteeLabels.map((label) => label.name).sort() : undefined,
+        title: repairedTitle !== undefined ? repairedTitle : giteeIssue.title || '',
+        content: repairedBody !== undefined ? this.stripSyncFooter(repairedBody) : giteeContent,
+        labels: repairedLabels
+          ? undefined
+          : giteeLabels
+            ? giteeLabels.map((label) => label.name).sort()
+            : undefined,
       });
 
       // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）
       await this.saveIssueReconcileStamp(issueMapping.id, giteeUpdatedAt);
 
-      return { success: true, data: { changed, held } };
+      return { success: true, data: { changed, held, repaired, repairFailed } };
     } catch (error) {
       return {
         success: false,
