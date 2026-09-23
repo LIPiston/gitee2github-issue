@@ -561,6 +561,27 @@ export class SyncService {
   }
 
   /**
+   * 把「刚比对过」的标记打脏：推送失败时调用。
+   * 省子请求的短路逻辑是「Gitee 的 updated_at 没变 + 上次比对还新 → 跳过」，可推送失败
+   * 恰恰不会让 Gitee 变动，于是这条会被一直跳过，对齐（和它的补推）永远没机会跑——
+   * 正是它要修的场景。打脏之后下一轮必须重新比对。
+   */
+  private async markIssueReconcileDirty(
+    repositoryId: number,
+    giteeIssueNumber: string
+  ): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `UPDATE issue_mappings SET verified_at = NULL WHERE repository_id = ? AND gitee_issue_number = ?`
+      )
+        .bind(repositoryId, giteeIssueNumber)
+        .run();
+    } catch (error) {
+      console.warn(`标记待比对失败（不影响同步）: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
    * 记录「这条成对 issue 刚做过一次完整比对」：Gitee 的 updated_at + 比对时间。
    * 下一轮对齐时若 Gitee 侧 updated_at 没变、且上次比对还比较新，就直接跳过
    * （未改动的成对 issue 只花 1 个子请求，这是能把全部 issue 放进一次调用的关键）。
@@ -880,8 +901,13 @@ export class SyncService {
             : undefined,
       });
 
-      // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）
-      await this.saveIssueReconcileStamp(issueMapping.id, giteeUpdatedAt);
+      // 记下这次完整比对的结果与时间：Gitee 侧没再更新的话，下一轮直接跳过（省子请求）。
+      // 但补推失败时**不记**：否则要等 7 天的强制完整比对才会再试一次（一次偶发失败不该拖那么久）。
+      if (repairFailed.length === 0) {
+        await this.saveIssueReconcileStamp(issueMapping.id, giteeUpdatedAt);
+      } else {
+        await this.markIssueReconcileDirty(repoMapping.id, giteeNumber);
+      }
 
       return { success: true, data: { changed, held, repaired, repairFailed } };
     } catch (error) {
@@ -1266,6 +1292,9 @@ export class SyncService {
         patch
       );
       if (!updateResult.success) {
+        // 推送没送达：把「刚比对过」的标记打脏，否则这条会被「Gitee 没变动就跳过」一直跳过，
+        // 对齐不会重看它，Gitee 会永久停在旧值上（对齐的补推正是为此存在的）
+        await this.markIssueReconcileDirty(repoMapping.id, issueMapping.gitee_issue_number);
         return { success: false, error: updateResult.error };
       }
       // 标题/正文写进了 Gitee：记下我们写进去的值（对齐时用来判断 Gitee 有没有被人改过，
@@ -1316,6 +1345,7 @@ export class SyncService {
         wanted.map((label) => ({ name: label.name, color: label.color }))
       );
       if (!ensureResult.success) {
+        await this.markIssueReconcileDirty(repoMapping.id, giteeIssueNumber);
         return { success: false, error: ensureResult.error };
       }
 
@@ -1341,6 +1371,7 @@ export class SyncService {
               names
             );
       if (!writeResult.success) {
+        await this.markIssueReconcileDirty(repoMapping.id, giteeIssueNumber);
         return { success: false, error: writeResult.error };
       }
 
